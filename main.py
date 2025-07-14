@@ -315,20 +315,26 @@ async def handle_slack_events(request: Request):
         body = await request.body()
         headers = request.headers
         
-        # Verify signature if signing secret is set
+        # Parse request first
+        try:
+            data = json.loads(body.decode())
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON: {e}")
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+        
+        # Handle URL verification FIRST (before signature check)
+        if data.get("type") == "url_verification":
+            challenge = data.get("challenge")
+            logger.info(f"URL verification challenge: {challenge}")
+            return JSONResponse({"challenge": challenge})
+        
+        # Verify signature for other requests
         if SLACK_SIGNING_SECRET:
             timestamp = headers.get("x-slack-request-timestamp")
             signature = headers.get("x-slack-signature")
             
             if not verify_slack_signature(body, timestamp, signature):
                 raise HTTPException(status_code=401, detail="Invalid signature")
-        
-        # Parse request
-        data = json.loads(body.decode())
-        
-        # Handle URL verification
-        if data.get("type") == "url_verification":
-            return JSONResponse({"challenge": data.get("challenge")})
         
         # Handle events
         if data.get("type") == "event_callback":
