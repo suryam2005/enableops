@@ -1,11 +1,6 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-slack-bolt>=1.18.0
-slack-sdk>=3.20.0
-websockets>=11.0
-psutil>=5.9.0
-openai==1.3.7
-supabase==2.3.0
-httpx==0.25.2
-pydantic==2.5.0
-python-multipart==0.0.6
+fastapi
+uvicorn[standard]
+slack-bolt
+openai
+httpx
+psutil
