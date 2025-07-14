@@ -1,4 +1,4 @@
-# main.py - Complete EnableBot for Railway
+# main.py - Fixed EnableBot with conditional imports
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -6,10 +6,6 @@ import asyncio
 import logging
 from datetime import datetime
 import time
-from slack_bolt.async_app import AsyncApp
-from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-from openai import OpenAI
-from supabase import create_client, Client
 from typing import Dict, Optional
 import json
 
@@ -38,9 +34,54 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Initialize clients
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+# Initialize clients with error handling
+openai_client = None
+supabase = None
+slack_available = False
+
+# Try to initialize OpenAI
+try:
+    if OPENAI_API_KEY:
+        from openai import OpenAI
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        logger.info("✅ OpenAI client initialized")
+    else:
+        logger.warning("⚠️ OpenAI API key not found")
+except ImportError as e:
+    logger.error(f"❌ Failed to import OpenAI: {e}")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize OpenAI: {e}")
+
+# Try to initialize Supabase
+try:
+    if SUPABASE_URL and SUPABASE_KEY:
+        from supabase import create_client, Client
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("✅ Supabase client initialized")
+    else:
+        logger.warning("⚠️ Supabase credentials not found")
+except ImportError as e:
+    logger.error(f"❌ Failed to import Supabase: {e}")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize Supabase: {e}")
+
+# Check if Slack dependencies are available
+try:
+    if SLACK_BOT_TOKEN and SLACK_APP_TOKEN:
+        # Only import Slack modules if we have tokens
+        from slack_bolt.async_app import AsyncApp
+        from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+        slack_available = True
+        logger.info("✅ Slack modules imported successfully")
+    else:
+        logger.warning("⚠️ Slack tokens not found - Socket Mode disabled")
+except ImportError as e:
+    logger.error(f"❌ Failed to import Slack modules: {e}")
+    logger.error("💡 Make sure aiohttp is installed: pip install aiohttp")
+    slack_available = False
+except Exception as e:
+    logger.error(f"❌ Error with Slack imports: {e}")
+    slack_available = False
 
 # Simple AI chat memory (in-memory for testing)
 chat_history: Dict[str, list] = {}
@@ -75,7 +116,7 @@ You are currently in test mode, so respond helpfully to any questions."""
             
             # Generate AI response
             if not openai_client:
-                return "Sorry, AI service is not available right now. Please try again later."
+                return "Sorry, AI service is not available right now. Please check the OpenAI API key configuration."
             
             # Prepare messages for OpenAI
             messages = [{"role": "system", "content": self.system_prompt}]
@@ -97,7 +138,7 @@ You are currently in test mode, so respond helpfully to any questions."""
             
         except Exception as e:
             logger.error(f"Error processing message: {e}")
-            return "I encountered an error processing your request. Please try again."
+            return f"I encountered an error processing your request: {str(e)}"
 
 class TypingIndicator:
     def __init__(self, client, channel):
@@ -159,6 +200,9 @@ class SimpleSocketBot:
     
     async def initialize(self):
         """Initialize Slack app and Socket Mode"""
+        if not slack_available:
+            raise Exception("Slack modules not available. Please check dependencies and tokens.")
+        
         if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
             raise Exception("SLACK_BOT_TOKEN and SLACK_APP_TOKEN are required")
         
@@ -218,6 +262,10 @@ class SimpleSocketBot:
     async def connect(self):
         """Connect to Slack via Socket Mode"""
         try:
+            if not slack_available:
+                logger.error("❌ Slack modules not available")
+                return False
+                
             logger.info("🔌 Connecting to Slack...")
             await self.socket_handler.start_async()
             self.is_connected = True
@@ -245,7 +293,8 @@ class SimpleSocketBot:
             "connected": self.is_connected,
             "messages_processed": self.message_count,
             "uptime_minutes": round(uptime / 60, 2),
-            "chat_sessions": len(chat_history)
+            "chat_sessions": len(chat_history),
+            "slack_available": slack_available
         }
 
 # Initialize the bot
@@ -261,11 +310,17 @@ async def root():
         "status": "ready",
         "bot_connected": bot.is_connected,
         "messages_processed": bot.message_count,
+        "services": {
+            "slack_available": slack_available,
+            "openai_available": bool(openai_client),
+            "supabase_available": bool(supabase)
+        },
         "endpoints": {
             "connect": "POST /connect",
             "disconnect": "POST /disconnect", 
             "status": "GET /status",
-            "health": "GET /health"
+            "health": "GET /health",
+            "test_ai": "POST /test-ai"
         }
     }
 
@@ -273,6 +328,12 @@ async def root():
 async def connect_bot():
     """Connect bot to Slack"""
     try:
+        if not slack_available:
+            raise HTTPException(
+                status_code=503, 
+                detail="Slack modules not available. Please check that aiohttp is installed and Slack tokens are provided."
+            )
+            
         if bot.is_connected:
             return {"status": "already_connected", "message": "Bot is already connected to Slack"}
         
@@ -307,12 +368,15 @@ async def get_status():
         "services": {
             "openai": bool(openai_client),
             "supabase": bool(supabase),
+            "slack_available": slack_available,
             "slack_tokens": bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN)
         },
         "environment": {
             "has_bot_token": bool(SLACK_BOT_TOKEN),
             "has_app_token": bool(SLACK_APP_TOKEN),
-            "has_openai_key": bool(OPENAI_API_KEY)
+            "has_openai_key": bool(OPENAI_API_KEY),
+            "has_supabase_url": bool(SUPABASE_URL),
+            "has_supabase_key": bool(SUPABASE_KEY)
         }
     }
 
@@ -320,11 +384,15 @@ async def get_status():
 async def health_check():
     """Health check endpoint"""
     return {
-        "status": "healthy" if bot.is_connected else "disconnected",
+        "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "bot_connected": bot.is_connected,
         "messages_processed": bot.message_count,
-        "environment_ok": bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN and OPENAI_API_KEY)
+        "services_ok": {
+            "slack": slack_available,
+            "openai": bool(openai_client),
+            "supabase": bool(supabase)
+        }
     }
 
 @app.get("/debug/environment")
@@ -336,6 +404,7 @@ async def debug_environment():
         "openai_key_set": bool(OPENAI_API_KEY),
         "supabase_url_set": bool(SUPABASE_URL),
         "supabase_key_set": bool(SUPABASE_KEY),
+        "slack_modules_available": slack_available,
         "bot_token_prefix": SLACK_BOT_TOKEN[:10] + "..." if SLACK_BOT_TOKEN else "Not set",
         "app_token_prefix": SLACK_APP_TOKEN[:10] + "..." if SLACK_APP_TOKEN else "Not set"
     }
@@ -344,6 +413,12 @@ async def debug_environment():
 async def test_ai_directly(message: str, user_id: str = "test_user"):
     """Test AI response without Slack (for debugging)"""
     try:
+        if not openai_client:
+            raise HTTPException(
+                status_code=503, 
+                detail="OpenAI client not available. Please check your API key."
+            )
+            
         response = await bot.ai_agent.process_message(user_id, message)
         return {
             "user_message": message,
@@ -356,19 +431,15 @@ async def test_ai_directly(message: str, user_id: str = "test_user"):
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
-    """Auto-connect on startup if tokens are available"""
+    """Startup without auto-connecting to avoid crashes"""
     logger.info("🚀 EnableBot Test starting up...")
+    logger.info(f"Services available: Slack={slack_available}, OpenAI={bool(openai_client)}, Supabase={bool(supabase)}")
     
-    if SLACK_BOT_TOKEN and SLACK_APP_TOKEN:
-        logger.info("Found Slack tokens, attempting auto-connect...")
-        try:
-            await bot.initialize()
-            await bot.connect()
-            logger.info("✅ Auto-connected to Slack successfully")
-        except Exception as e:
-            logger.error(f"❌ Auto-connect failed: {e}")
+    # Don't auto-connect to avoid startup crashes
+    if slack_available and SLACK_BOT_TOKEN and SLACK_APP_TOKEN:
+        logger.info("✅ Slack configuration detected - ready for manual connection")
     else:
-        logger.warning("⚠️ Slack tokens not found, manual connection required")
+        logger.warning("⚠️ Slack not configured - add tokens to enable Socket Mode")
 
 @app.on_event("shutdown")
 async def shutdown_event():
