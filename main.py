@@ -1,23 +1,27 @@
-# main.py - Fixed EnableBot with conditional imports
-from fastapi import FastAPI, HTTPException
+# main.py - Working EnableBot for Railway
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import os
 import asyncio
 import logging
-from datetime import datetime
 import time
-from typing import Dict, Optional
 import json
+import hmac
+import hashlib
+from datetime import datetime
+from typing import Dict, Optional, List
+from pydantic import BaseModel
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
-app = FastAPI(title="EnableBot Test", version="1.0.0")
+app = FastAPI(title="EnableBot", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,66 +31,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Environment configuration
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN") 
+# Environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 
-# Initialize clients with error handling
+# Initialize OpenAI client
 openai_client = None
-supabase = None
-slack_available = False
-
-# Try to initialize OpenAI
-try:
-    if OPENAI_API_KEY:
+if OPENAI_API_KEY:
+    try:
         from openai import OpenAI
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
         logger.info("✅ OpenAI client initialized")
-    else:
-        logger.warning("⚠️ OpenAI API key not found")
-except ImportError as e:
-    logger.error(f"❌ Failed to import OpenAI: {e}")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize OpenAI: {e}")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize OpenAI: {e}")
 
-# Try to initialize Supabase
-try:
-    if SUPABASE_URL and SUPABASE_KEY:
-        from supabase import create_client, Client
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("✅ Supabase client initialized")
-    else:
-        logger.warning("⚠️ Supabase credentials not found")
-except ImportError as e:
-    logger.error(f"❌ Failed to import Supabase: {e}")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize Supabase: {e}")
+# Slack HTTP client
+slack_client = None
+if SLACK_BOT_TOKEN:
+    import httpx
+    slack_client = httpx.AsyncClient(
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        timeout=30.0
+    )
+    logger.info("✅ Slack HTTP client initialized")
 
-# Check if Slack dependencies are available
-try:
-    if SLACK_BOT_TOKEN and SLACK_APP_TOKEN:
-        # Only import Slack modules if we have tokens
-        from slack_bolt.async_app import AsyncApp
-        from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-        slack_available = True
-        logger.info("✅ Slack modules imported successfully")
-    else:
-        logger.warning("⚠️ Slack tokens not found - Socket Mode disabled")
-except ImportError as e:
-    logger.error(f"❌ Failed to import Slack modules: {e}")
-    logger.error("💡 Make sure aiohttp is installed: pip install aiohttp")
-    slack_available = False
-except Exception as e:
-    logger.error(f"❌ Error with Slack imports: {e}")
-    slack_available = False
+# In-memory storage (replace with database later)
+chat_memory = {}
+typing_tasks = {}
 
-# Simple AI chat memory (in-memory for testing)
-chat_history: Dict[str, list] = {}
+# Pydantic models
+class SlackEvent(BaseModel):
+    type: str
+    user: Optional[str] = None
+    text: Optional[str] = None
+    channel: Optional[str] = None
+    ts: Optional[str] = None
+    bot_id: Optional[str] = None
+    thread_ts: Optional[str] = None
 
-class SimpleAIAgent:
+class SlackChallenge(BaseModel):
+    token: str
+    challenge: str
+    type: str
+
+class SlackEventWrapper(BaseModel):
+    token: Optional[str] = None
+    team_id: Optional[str] = None
+    api_app_id: Optional[str] = None
+    event: Optional[SlackEvent] = None
+    type: str
+    event_id: Optional[str] = None
+    event_time: Optional[int] = None
+    challenge: Optional[str] = None
+
+class EnableBotAI:
     def __init__(self):
         self.system_prompt = """You are EnableOps Assistant, a helpful internal AI assistant.
 
@@ -94,34 +93,34 @@ You help employees with topics such as HR, IT, onboarding, tool access, complian
 
 Key behaviors:
 - Be professional, friendly, and helpful
-- Keep responses concise but informative
+- Keep responses concise but informative (under 500 words)
 - If you don't know something, admit it and offer to help find the answer
-- Always respond in plain text without special formatting
+- Always respond in plain text without markdown formatting
+- Focus on being practical and actionable in your advice
 
-You are currently in test mode, so respond helpfully to any questions."""
+You are designed to help with workplace questions and provide support for common business needs."""
 
     async def process_message(self, user_id: str, message: str) -> str:
-        """Process user message and generate AI response"""
+        """Process message and generate AI response"""
         try:
-            # Get or create chat history for user
-            if user_id not in chat_history:
-                chat_history[user_id] = []
+            if not openai_client:
+                return "I'm sorry, but I'm not able to access my AI capabilities right now. Please try again later or contact your IT support."
+
+            # Get conversation history
+            history = chat_memory.get(user_id, [])
             
-            # Add user message to history
-            chat_history[user_id].append({"role": "user", "content": message})
+            # Add current message to history
+            history.append({"role": "user", "content": message})
             
             # Keep only last 10 messages to avoid token limits
-            if len(chat_history[user_id]) > 20:  # 10 back-and-forth
-                chat_history[user_id] = chat_history[user_id][-20:]
+            if len(history) > 20:
+                history = history[-20:]
             
-            # Generate AI response
-            if not openai_client:
-                return "Sorry, AI service is not available right now. Please check the OpenAI API key configuration."
-            
-            # Prepare messages for OpenAI
+            # Build messages for OpenAI
             messages = [{"role": "system", "content": self.system_prompt}]
-            messages.extend(chat_history[user_id][-10:])  # Last 5 exchanges
+            messages.extend(history[-10:])  # Last 5 exchanges
             
+            # Generate response
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
@@ -132,251 +131,163 @@ You are currently in test mode, so respond helpfully to any questions."""
             ai_response = response.choices[0].message.content
             
             # Add AI response to history
-            chat_history[user_id].append({"role": "assistant", "content": ai_response})
+            history.append({"role": "assistant", "content": ai_response})
+            chat_memory[user_id] = history
             
             return ai_response
             
         except Exception as e:
             logger.error(f"Error processing message: {e}")
-            return f"I encountered an error processing your request: {str(e)}"
+            return "I encountered an error while processing your request. Please try again, and if the problem persists, contact your IT support team."
 
-class TypingIndicator:
-    def __init__(self, client, channel):
-        self.client = client
-        self.channel = channel
-        self.typing_message_ts = None
+class SlackAPI:
+    def __init__(self):
+        self.base_url = "https://slack.com/api"
     
-    async def start(self):
-        """Show typing indicator"""
+    async def send_message(self, channel: str, text: str, thread_ts: str = None) -> bool:
+        """Send message to Slack channel"""
+        if not slack_client:
+            logger.error("Slack client not initialized")
+            return False
+        
         try:
-            response = await self.client.chat_postMessage(
-                channel=self.channel,
-                text="🤔 Thinking..."
-            )
-            self.typing_message_ts = response["ts"]
+            payload = {
+                "channel": channel,
+                "text": text
+            }
+            if thread_ts:
+                payload["thread_ts"] = thread_ts
             
-            # Update after 1 second
-            await asyncio.sleep(1)
-            await self.client.chat_update(
-                channel=self.channel,
-                ts=self.typing_message_ts,
-                text="⚡ Processing your request..."
+            response = await slack_client.post(
+                f"{self.base_url}/chat.postMessage",
+                json=payload
             )
+            
+            result = response.json()
+            if result.get("ok"):
+                logger.info(f"✅ Message sent to {channel}")
+                return True
+            else:
+                logger.error(f"❌ Slack API error: {result.get('error')}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error sending Slack message: {e}")
+            return False
+    
+    async def update_message(self, channel: str, ts: str, text: str) -> bool:
+        """Update existing message"""
+        if not slack_client:
+            return False
+        
+        try:
+            response = await slack_client.post(
+                f"{self.base_url}/chat.update",
+                json={
+                    "channel": channel,
+                    "ts": ts,
+                    "text": text
+                }
+            )
+            
+            result = response.json()
+            return result.get("ok", False)
             
         except Exception as e:
-            logger.error(f"Error showing typing indicator: {e}")
+            logger.error(f"Error updating message: {e}")
+            return False
+
+class TypingIndicator:
+    def __init__(self, slack_api: SlackAPI, channel: str):
+        self.slack_api = slack_api
+        self.channel = channel
+        self.message_ts = None
+        self.is_active = False
+    
+    async def start(self):
+        """Start typing indicator"""
+        try:
+            # Send initial thinking message
+            response = await slack_client.post(
+                "https://slack.com/api/chat.postMessage",
+                json={
+                    "channel": self.channel,
+                    "text": "🤔 Thinking..."
+                }
+            )
+            
+            result = response.json()
+            if result.get("ok"):
+                self.message_ts = result["ts"]
+                self.is_active = True
+                
+                # Update after 1 second
+                await asyncio.sleep(1)
+                if self.is_active:
+                    await self.slack_api.update_message(
+                        self.channel, 
+                        self.message_ts, 
+                        "⚡ Processing your request..."
+                    )
+                
+        except Exception as e:
+            logger.error(f"Error starting typing indicator: {e}")
     
     async def stop_and_respond(self, final_message: str):
         """Replace typing indicator with final response"""
+        self.is_active = False
         try:
-            if self.typing_message_ts:
-                await self.client.chat_update(
-                    channel=self.channel,
-                    ts=self.typing_message_ts,
-                    text=final_message
+            if self.message_ts:
+                await self.slack_api.update_message(
+                    self.channel,
+                    self.message_ts,
+                    final_message
                 )
             else:
-                # Fallback: send new message
-                await self.client.chat_postMessage(
-                    channel=self.channel,
-                    text=final_message
-                )
+                await self.slack_api.send_message(self.channel, final_message)
         except Exception as e:
-            logger.error(f"Error updating message: {e}")
+            logger.error(f"Error updating final message: {e}")
             # Fallback: send new message
-            await self.client.chat_postMessage(
-                channel=self.channel,
-                text=final_message
-            )
+            await self.slack_api.send_message(self.channel, final_message)
 
-class SimpleSocketBot:
-    def __init__(self):
-        self.ai_agent = SimpleAIAgent()
-        self.slack_app = None
-        self.socket_handler = None
-        self.is_connected = False
-        self.message_count = 0
-        self.start_time = time.time()
-    
-    async def initialize(self):
-        """Initialize Slack app and Socket Mode"""
-        if not slack_available:
-            raise Exception("Slack modules not available. Please check dependencies and tokens.")
-        
-        if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
-            raise Exception("SLACK_BOT_TOKEN and SLACK_APP_TOKEN are required")
-        
-        # Create Slack app
-        self.slack_app = AsyncApp(token=SLACK_BOT_TOKEN)
-        
-        # Set up message handler
-        @self.slack_app.event("message")
-        async def handle_message_events(body, logger, client):
-            event = body["event"]
-            
-            # Skip bot messages, edited messages, and threaded messages
-            if (event.get("bot_id") or 
-                event.get("subtype") == "bot_message" or
-                event.get("subtype") == "message_changed" or
-                event.get("thread_ts")):
-                return
-            
-            channel = event["channel"]
-            user = event["user"]
-            text = event.get("text", "")
-            
-            # Skip empty messages
-            if not text.strip():
-                return
-            
-            self.message_count += 1
-            logger.info(f"Processing message #{self.message_count} from user {user}: {text[:50]}...")
-            
-            # Show typing indicator
-            typing = TypingIndicator(client, channel)
-            await typing.start()
-            
-            try:
-                # Process with AI
-                ai_response = await self.ai_agent.process_message(user, text)
-                
-                # Send response (replaces typing indicator)
-                await typing.stop_and_respond(ai_response)
-                
-                logger.info(f"✅ Responded to user {user}")
-                
-            except Exception as e:
-                logger.error(f"❌ Error processing message: {e}")
-                await typing.stop_and_respond("Sorry, I encountered an error. Please try again.")
-        
-        # Error handler
-        @self.slack_app.error
-        async def custom_error_handler(error, body, logger):
-            logger.error(f"Slack error: {error}")
-        
-        # Create Socket Mode handler
-        self.socket_handler = AsyncSocketModeHandler(self.slack_app, SLACK_APP_TOKEN)
-        
-        logger.info("✅ Bot initialized successfully")
-    
-    async def connect(self):
-        """Connect to Slack via Socket Mode"""
-        try:
-            if not slack_available:
-                logger.error("❌ Slack modules not available")
-                return False
-                
-            logger.info("🔌 Connecting to Slack...")
-            await self.socket_handler.start_async()
-            self.is_connected = True
-            logger.info("🚀 Socket Mode connected successfully!")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to connect: {e}")
-            self.is_connected = False
-            return False
-    
-    async def disconnect(self):
-        """Disconnect from Slack"""
-        try:
-            if self.socket_handler:
-                await self.socket_handler.close_async()
-            self.is_connected = False
-            logger.info("👋 Disconnected from Slack")
-        except Exception as e:
-            logger.error(f"Error disconnecting: {e}")
-    
-    def get_stats(self):
-        """Get bot statistics"""
-        uptime = time.time() - self.start_time
-        return {
-            "connected": self.is_connected,
-            "messages_processed": self.message_count,
-            "uptime_minutes": round(uptime / 60, 2),
-            "chat_sessions": len(chat_history),
-            "slack_available": slack_available
-        }
+# Initialize components
+ai_agent = EnableBotAI()
+slack_api = SlackAPI()
 
-# Initialize the bot
-bot = SimpleSocketBot()
+def verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
+    """Verify Slack request signature"""
+    if not SLACK_SIGNING_SECRET:
+        return True  # Skip verification if no secret set
+    
+    try:
+        request_hash = f"v0:{timestamp}:{body.decode()}"
+        expected_signature = "v0=" + hmac.new(
+            SLACK_SIGNING_SECRET.encode(),
+            request_hash.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        return hmac.compare_digest(signature, expected_signature)
+    except Exception as e:
+        logger.error(f"Error verifying signature: {e}")
+        return False
 
-# API Endpoints
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
-        "message": "EnableBot Test API",
-        "version": "1.0.0", 
-        "status": "ready",
-        "bot_connected": bot.is_connected,
-        "messages_processed": bot.message_count,
-        "services": {
-            "slack_available": slack_available,
-            "openai_available": bool(openai_client),
-            "supabase_available": bool(supabase)
-        },
-        "endpoints": {
-            "connect": "POST /connect",
-            "disconnect": "POST /disconnect", 
-            "status": "GET /status",
-            "health": "GET /health",
-            "test_ai": "POST /test-ai"
-        }
-    }
-
-@app.post("/connect")
-async def connect_bot():
-    """Connect bot to Slack"""
-    try:
-        if not slack_available:
-            raise HTTPException(
-                status_code=503, 
-                detail="Slack modules not available. Please check that aiohttp is installed and Slack tokens are provided."
-            )
-            
-        if bot.is_connected:
-            return {"status": "already_connected", "message": "Bot is already connected to Slack"}
-        
-        await bot.initialize()
-        success = await bot.connect()
-        
-        if success:
-            return {"status": "success", "message": "Bot connected to Slack successfully"}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to connect to Slack")
-    
-    except Exception as e:
-        logger.error(f"Connection error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/disconnect")
-async def disconnect_bot():
-    """Disconnect bot from Slack"""
-    try:
-        await bot.disconnect()
-        return {"status": "success", "message": "Bot disconnected from Slack"}
-    except Exception as e:
-        logger.error(f"Disconnection error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/status")
-async def get_status():
-    """Get bot status and statistics"""
-    stats = bot.get_stats()
-    return {
-        "bot_status": stats,
+        "message": "EnableBot API",
+        "version": "1.0.0",
+        "status": "running",
+        "timestamp": datetime.now().isoformat(),
         "services": {
             "openai": bool(openai_client),
-            "supabase": bool(supabase),
-            "slack_available": slack_available,
-            "slack_tokens": bool(SLACK_BOT_TOKEN and SLACK_APP_TOKEN)
+            "slack": bool(slack_client)
         },
-        "environment": {
-            "has_bot_token": bool(SLACK_BOT_TOKEN),
-            "has_app_token": bool(SLACK_APP_TOKEN),
-            "has_openai_key": bool(OPENAI_API_KEY),
-            "has_supabase_url": bool(SUPABASE_URL),
-            "has_supabase_key": bool(SUPABASE_KEY)
+        "endpoints": {
+            "slack_events": "POST /slack/events",
+            "health": "GET /health",
+            "test": "POST /test-ai"
         }
     }
 
@@ -386,75 +297,143 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "bot_connected": bot.is_connected,
-        "messages_processed": bot.message_count,
-        "services_ok": {
-            "slack": slack_available,
+        "services": {
             "openai": bool(openai_client),
-            "supabase": bool(supabase)
+            "slack": bool(slack_client)
+        },
+        "memory": {
+            "active_conversations": len(chat_memory),
+            "typing_indicators": len(typing_tasks)
         }
     }
 
-@app.get("/debug/environment")
-async def debug_environment():
-    """Debug endpoint to check environment variables"""
-    return {
-        "slack_bot_token_set": bool(SLACK_BOT_TOKEN),
-        "slack_app_token_set": bool(SLACK_APP_TOKEN),
-        "openai_key_set": bool(OPENAI_API_KEY),
-        "supabase_url_set": bool(SUPABASE_URL),
-        "supabase_key_set": bool(SUPABASE_KEY),
-        "slack_modules_available": slack_available,
-        "bot_token_prefix": SLACK_BOT_TOKEN[:10] + "..." if SLACK_BOT_TOKEN else "Not set",
-        "app_token_prefix": SLACK_APP_TOKEN[:10] + "..." if SLACK_APP_TOKEN else "Not set"
-    }
+@app.post("/slack/events")
+async def handle_slack_events(request: Request):
+    """Handle Slack events via HTTP webhooks"""
+    try:
+        # Get request body and headers
+        body = await request.body()
+        headers = request.headers
+        
+        # Verify signature if signing secret is set
+        if SLACK_SIGNING_SECRET:
+            timestamp = headers.get("x-slack-request-timestamp")
+            signature = headers.get("x-slack-signature")
+            
+            if not verify_slack_signature(body, timestamp, signature):
+                raise HTTPException(status_code=401, detail="Invalid signature")
+        
+        # Parse request
+        data = json.loads(body.decode())
+        
+        # Handle URL verification
+        if data.get("type") == "url_verification":
+            return JSONResponse({"challenge": data.get("challenge")})
+        
+        # Handle events
+        if data.get("type") == "event_callback":
+            event = data.get("event", {})
+            
+            # Skip bot messages and file shares
+            if (event.get("bot_id") or 
+                event.get("subtype") in ["bot_message", "file_share", "message_changed"] or
+                event.get("thread_ts")):
+                return JSONResponse({"status": "ignored"})
+            
+            channel = event.get("channel")
+            user = event.get("user")
+            text = event.get("text", "").strip()
+            
+            if not all([channel, user, text]):
+                return JSONResponse({"status": "ignored"})
+            
+            # Process message asynchronously
+            asyncio.create_task(process_slack_message(channel, user, text))
+        
+        return JSONResponse({"status": "ok"})
+        
+    except Exception as e:
+        logger.error(f"Error handling Slack event: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+async def process_slack_message(channel: str, user: str, text: str):
+    """Process Slack message with typing indicator"""
+    try:
+        # Start typing indicator
+        typing = TypingIndicator(slack_api, channel)
+        typing_tasks[f"{channel}_{user}"] = typing
+        
+        await typing.start()
+        
+        # Generate AI response
+        ai_response = await ai_agent.process_message(user, text)
+        
+        # Send final response
+        await typing.stop_and_respond(ai_response)
+        
+        # Clean up
+        if f"{channel}_{user}" in typing_tasks:
+            del typing_tasks[f"{channel}_{user}"]
+        
+        logger.info(f"✅ Processed message from {user} in {channel}")
+        
+    except Exception as e:
+        logger.error(f"Error processing message: {e}")
+        # Send error message
+        await slack_api.send_message(
+            channel, 
+            "I'm sorry, I encountered an error processing your message. Please try again."
+        )
 
 @app.post("/test-ai")
-async def test_ai_directly(message: str, user_id: str = "test_user"):
-    """Test AI response without Slack (for debugging)"""
+async def test_ai(message: str, user_id: str = "test_user"):
+    """Test AI functionality directly"""
     try:
         if not openai_client:
             raise HTTPException(
                 status_code=503, 
-                detail="OpenAI client not available. Please check your API key."
+                detail="OpenAI service not available. Please check API key."
             )
-            
-        response = await bot.ai_agent.process_message(user_id, message)
+        
+        response = await ai_agent.process_message(user_id, message)
         return {
-            "user_message": message,
+            "user_input": message,
             "ai_response": response,
-            "user_id": user_id
+            "user_id": user_id,
+            "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Startup and shutdown events
-@app.on_event("startup")
-async def startup_event():
-    """Startup without auto-connecting to avoid crashes"""
-    logger.info("🚀 EnableBot Test starting up...")
-    logger.info(f"Services available: Slack={slack_available}, OpenAI={bool(openai_client)}, Supabase={bool(supabase)}")
-    
-    # Don't auto-connect to avoid startup crashes
-    if slack_available and SLACK_BOT_TOKEN and SLACK_APP_TOKEN:
-        logger.info("✅ Slack configuration detected - ready for manual connection")
-    else:
-        logger.warning("⚠️ Slack not configured - add tokens to enable Socket Mode")
+@app.get("/debug")
+async def debug_info():
+    """Debug endpoint"""
+    return {
+        "environment": {
+            "openai_key_set": bool(OPENAI_API_KEY),
+            "slack_token_set": bool(SLACK_BOT_TOKEN),
+            "slack_secret_set": bool(SLACK_SIGNING_SECRET)
+        },
+        "services": {
+            "openai_client": bool(openai_client),
+            "slack_client": bool(slack_client)
+        },
+        "memory": {
+            "chat_sessions": len(chat_memory),
+            "active_typing": len(typing_tasks)
+        }
+    }
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    logger.info("👋 EnableBot Test shutting down...")
-    await bot.disconnect()
+@app.delete("/reset")
+async def reset_memory():
+    """Reset chat memory (for testing)"""
+    global chat_memory, typing_tasks
+    chat_memory.clear()
+    typing_tasks.clear()
+    return {"status": "memory_reset", "timestamp": datetime.now().isoformat()}
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    logger.info(f"Starting server on port {port}")
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=port,
-        workers=1,  # Socket Mode requires single worker
-        loop="asyncio"
-    )
+    logger.info(f"🚀 Starting EnableBot on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
