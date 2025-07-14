@@ -336,25 +336,81 @@ async def handle_slack_events(request: Request):
             if not verify_slack_signature(body, timestamp, signature):
                 raise HTTPException(status_code=401, detail="Invalid signature")
         
+@app.post("/slack/events")
+async def handle_slack_events(request: Request):
+    """Handle Slack events via HTTP webhooks"""
+    try:
+        # Get request body and headers
+        body = await request.body()
+        headers = request.headers
+        
+        # Parse request first
+        try:
+            data = json.loads(body.decode())
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON: {e}")
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+        
+        # Log all incoming requests for debugging
+        logger.info(f"📩 Received Slack event: {data.get('type', 'unknown')}")
+        
+        # Handle URL verification FIRST (before signature check)
+        if data.get("type") == "url_verification":
+            challenge = data.get("challenge")
+            logger.info(f"URL verification challenge: {challenge}")
+            return JSONResponse({"challenge": challenge})
+        
+        # Verify signature for other requests
+        if SLACK_SIGNING_SECRET:
+            timestamp = headers.get("x-slack-request-timestamp")
+            signature = headers.get("x-slack-signature")
+            
+            if not verify_slack_signature(body, timestamp, signature):
+                logger.error("❌ Invalid Slack signature")
+                raise HTTPException(status_code=401, detail="Invalid signature")
+        
         # Handle events
         if data.get("type") == "event_callback":
             event = data.get("event", {})
+            event_type = event.get("type", "unknown")
+            channel_type = event.get("channel_type", "unknown")
+            
+            logger.info(f"📨 Event: {event_type}, Channel type: {channel_type}, User: {event.get('user', 'unknown')}")
             
             # Skip bot messages and file shares
             if (event.get("bot_id") or 
                 event.get("subtype") in ["bot_message", "file_share", "message_changed"] or
                 event.get("thread_ts")):
+                logger.info("⏭️ Skipping bot/system message")
                 return JSONResponse({"status": "ignored"})
             
-            channel = event.get("channel")
-            user = event.get("user")
-            text = event.get("text", "").strip()
+            # Handle both channel messages and DMs
+            if event_type == "message":
+                channel = event.get("channel")
+                user = event.get("user")
+                text = event.get("text", "").strip()
+                
+                logger.info(f"📝 Message in {channel_type}: '{text[:50]}...' from {user} in {channel}")
+                
+                if not all([channel, user, text]):
+                    logger.warning(f"⚠️ Missing required fields: channel={bool(channel)}, user={bool(user)}, text={bool(text)}")
+                    return JSONResponse({"status": "ignored"})
+                
+                # Process message asynchronously
+                asyncio.create_task(process_slack_message(channel, user, text))
+                logger.info("🚀 Message queued for processing")
             
-            if not all([channel, user, text]):
-                return JSONResponse({"status": "ignored"})
-            
-            # Process message asynchronously
-            asyncio.create_task(process_slack_message(channel, user, text))
+            # Handle app mentions
+            elif event_type == "app_mention":
+                channel = event.get("channel")
+                user = event.get("user")
+                text = event.get("text", "").strip()
+                
+                logger.info(f"📢 App mention: '{text[:50]}...' from {user} in {channel}")
+                
+                if all([channel, user, text]):
+                    asyncio.create_task(process_slack_message(channel, user, text))
+                    logger.info("🚀 Mention queued for processing")
         
         return JSONResponse({"status": "ok"})
         
