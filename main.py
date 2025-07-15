@@ -1,5 +1,5 @@
-# main.py - EnableBot with Jira Integration
-from fastapi import FastAPI, HTTPException, Request
+# main.py - Complete EnableBot SaaS Backend
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 import os
@@ -11,9 +11,12 @@ import hmac
 import hashlib
 import httpx
 import base64
+import asyncpg
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Any
 from pydantic import BaseModel
+import numpy as np
+from sentence_transformers import SentenceTransformer
 
 # Configure logging
 logging.basicConfig(
@@ -23,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
-app = FastAPI(title="EnableBot", version="1.0.0")
+app = FastAPI(title="EnableBot SaaS", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,7 +40,10 @@ app.add_middleware(
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
-JIRA_URL = os.getenv("JIRA_URL")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+POSTGRES_URL = os.getenv("POSTGRES_URL")
+JIRA_URL = os.getenv("JIRA_URL", "https://surya-ai.atlassian.net")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
@@ -51,7 +57,7 @@ if OPENAI_API_KEY:
     except Exception as e:
         logger.error(f"❌ Failed to initialize OpenAI: {e}")
 
-# Slack HTTP client
+# Initialize Slack client
 slack_client = None
 if SLACK_BOT_TOKEN:
     slack_client = httpx.AsyncClient(
@@ -60,9 +66,24 @@ if SLACK_BOT_TOKEN:
     )
     logger.info("✅ Slack HTTP client initialized")
 
-# Jira HTTP client
+# Initialize Supabase client
+supabase_client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase_client = httpx.AsyncClient(
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json"
+        },
+        timeout=30.0
+    )
+    logger.info("✅ Supabase HTTP client initialized")
+
+# Initialize PostgreSQL connection pool
+postgres_pool = None
+
+# Initialize Jira client
 jira_client = None
-jira_projects = []
 if JIRA_URL and JIRA_EMAIL and JIRA_API_TOKEN:
     try:
         auth_string = f"{JIRA_EMAIL}:{JIRA_API_TOKEN}"
@@ -80,13 +101,20 @@ if JIRA_URL and JIRA_EMAIL and JIRA_API_TOKEN:
     except Exception as e:
         logger.error(f"❌ Failed to initialize Jira: {e}")
 
-# In-memory storage
-chat_memory = {}
-typing_tasks = {}
+# Initialize sentence transformer for embeddings
+embedding_model = None
+try:
+    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    logger.info("✅ Sentence transformer initialized")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize embedding model: {e}")
+
+# In-memory storage for sessions
+chat_sessions = {}
 usage_stats = {
     "total_messages": 0,
-    "total_tokens": 847000,
-    "total_cost": 12.45,
+    "total_tokens": 0,
+    "total_cost": 0.0,
     "daily_usage": {},
     "start_time": datetime.now()
 }
@@ -99,170 +127,249 @@ class SlackEvent(BaseModel):
     channel: Optional[str] = None
     ts: Optional[str] = None
     bot_id: Optional[str] = None
-    thread_ts: Optional[str] = None
+    blocks: Optional[List[Dict]] = None
+
+class SlackEventWrapper(BaseModel):
+    token: Optional[str] = None
+    team_id: Optional[str] = None
+    event: Optional[SlackEvent] = None
+    type: str
+    challenge: Optional[str] = None
+
+class UserProfile(BaseModel):
+    slack_user_id: str
+    full_name: str
+    role: str
+    department: str
+    location: str
+    tool_access: List[str]
+
+class JiraTicketRequest(BaseModel):
+    summary: str
+    description: Optional[str] = ""
+    issue_type: str = "Task"
+    priority: str = "Medium"
 
 class JiraConnectionRequest(BaseModel):
     jira_url: str
     email: str
     api_token: str
 
-class JiraTicketRequest(BaseModel):
-    project_key: str
-    summary: str
-    description: str
-    issue_type: str = "Task"
-    priority: str = "Medium"
-
-class EnableBotAI:
-    def __init__(self):
-        self.system_prompt = """You are EnableOps Assistant, a helpful internal AI assistant.
-
-You help employees with topics such as HR, IT, onboarding, tool access, compliance, internal policies, and general support.
-
-Key behaviors:
-- Be professional, friendly, and helpful
-- Keep responses concise but informative (under 500 words)
-- If you don't know something, admit it and offer to help find the answer
-- Always respond in plain text without markdown formatting
-- Focus on being practical and actionable in your advice
-- When users mention issues or problems, suggest creating a Jira ticket for tracking
-
-You can now help create Jira tickets for:
-- IT support requests
-- Bug reports
-- Feature requests
-- Access requests
-- General tasks and issues
-
-You are designed to help with workplace questions and provide support for common business needs."""
-
-    async def process_message(self, user_id: str, message: str) -> str:
-        """Process message and generate AI response"""
-        try:
-            if not openai_client:
-                return "I'm sorry, but I'm not able to access my AI capabilities right now. Please try again later or contact your IT support."
-
-            # Check if message is about creating tickets
-            ticket_keywords = ["ticket", "issue", "bug", "problem", "request", "help", "support", "broken", "not working"]
-            if any(keyword in message.lower() for keyword in ticket_keywords) and jira_client:
-                message += "\n\nNote: I can help you create a Jira ticket for this issue if needed. Just let me know!"
-
-            # Get conversation history
-            history = chat_memory.get(user_id, [])
-            
-            # Add current message to history
-            history.append({"role": "user", "content": message})
-            
-            # Keep only last 10 messages to avoid token limits
-            if len(history) > 20:
-                history = history[-20:]
-            
-            # Build messages for OpenAI
-            messages = [{"role": "system", "content": self.system_prompt}]
-            messages.extend(history[-10:])
-            
-            # Generate response
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                max_tokens=500,
-                temperature=0.7
-            )
-            
-            ai_response = response.choices[0].message.content
-            
-            # Add AI response to history
-            history.append({"role": "assistant", "content": ai_response})
-            chat_memory[user_id] = history
-            
-            # Update usage stats
-            update_usage_stats(response.usage.total_tokens, 0.003)
-            
-            return ai_response
-            
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
-            return "I encountered an error while processing your request. Please try again, and if the problem persists, contact your IT support team."
-
-class JiraIntegration:
-    @staticmethod
-    async def test_connection(jira_url: str, email: str, api_token: str) -> Dict[str, Any]:
-        """Test Jira connection"""
-        try:
-            auth_string = f"{email}:{api_token}"
-            encoded_auth = base64.b64encode(auth_string.encode()).decode()
-            
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"{jira_url}/rest/api/3/myself",
-                    headers={
-                        "Authorization": f"Basic {encoded_auth}",
-                        "Accept": "application/json"
-                    }
-                )
-                
-                if response.status_code == 200:
-                    user_info = response.json()
-                    return {
-                        "success": True,
-                        "user": user_info.get("displayName", "Unknown"),
-                        "email": user_info.get("emailAddress", email)
-                    }
-                else:
-                    return {
-                        "success": False,
-                        "error": f"Authentication failed: {response.status_code}"
-                    }
-                    
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
+class DatabaseManager:
+    """Handle all database operations"""
     
     @staticmethod
-    async def get_projects() -> List[Dict[str, Any]]:
-        """Get available Jira projects"""
-        if not jira_client:
+    async def init_postgres():
+        """Initialize PostgreSQL connection pool"""
+        global postgres_pool
+        if POSTGRES_URL and not postgres_pool:
+            try:
+                postgres_pool = await asyncpg.create_pool(POSTGRES_URL, min_size=1, max_size=5)
+                await DatabaseManager.create_tables()
+                logger.info("✅ PostgreSQL pool initialized")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize PostgreSQL: {e}")
+    
+    @staticmethod
+    async def create_tables():
+        """Create necessary tables"""
+        if not postgres_pool:
+            return
+        
+        async with postgres_pool.acquire() as conn:
+            # Chat memory table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_memory (
+                    id SERIAL PRIMARY KEY,
+                    session_id VARCHAR(255) NOT NULL,
+                    message_type VARCHAR(20) NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            # Jira tickets memory
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS jira_tickets (
+                    id SERIAL PRIMARY KEY,
+                    user_id VARCHAR(255) NOT NULL,
+                    ticket_key VARCHAR(50) NOT NULL,
+                    summary TEXT NOT NULL,
+                    status VARCHAR(50),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            logger.info("✅ Database tables created/verified")
+    
+    @staticmethod
+    async def get_user_profile(slack_user_id: str) -> Optional[UserProfile]:
+        """Get user profile from Supabase"""
+        if not supabase_client:
+            return None
+        
+        try:
+            response = await supabase_client.get(
+                f"{SUPABASE_URL}/rest/v1/user_profiles",
+                params={"slack_user_id": f"eq.{slack_user_id}"}
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data:
+                    user_data = data[0]
+                    return UserProfile(
+                        slack_user_id=user_data["slack_user_id"],
+                        full_name=user_data["full_name"],
+                        role=user_data["role"],
+                        department=user_data["department"],
+                        location=user_data["location"],
+                        tool_access=user_data["tool_access"] or []
+                    )
+        except Exception as e:
+            logger.error(f"Error fetching user profile: {e}")
+        
+        return None
+    
+    @staticmethod
+    async def get_chat_history(session_id: str, limit: int = 10) -> List[Dict]:
+        """Get chat history from PostgreSQL"""
+        if not postgres_pool:
             return []
         
         try:
-            response = await jira_client.get(f"{JIRA_URL}/rest/api/3/project")
-            if response.status_code == 200:
-                projects = response.json()
-                return [
-                    {
-                        "key": project["key"],
-                        "name": project["name"],
-                        "id": project["id"]
-                    }
-                    for project in projects
-                ]
-            return []
+            async with postgres_pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT message_type, content FROM chat_memory 
+                    WHERE session_id = $1 
+                    ORDER BY created_at DESC 
+                    LIMIT $2
+                """, session_id, limit)
+                
+                history = []
+                for row in reversed(rows):
+                    history.append({
+                        "role": "user" if row["message_type"] == "human" else "assistant",
+                        "content": row["content"]
+                    })
+                
+                return history
         except Exception as e:
-            logger.error(f"Error fetching projects: {e}")
+            logger.error(f"Error fetching chat history: {e}")
             return []
     
     @staticmethod
-    async def create_ticket(ticket_data: JiraTicketRequest) -> Dict[str, Any]:
-        """Create a Jira ticket"""
+    async def save_chat_message(session_id: str, message_type: str, content: str):
+        """Save chat message to PostgreSQL"""
+        if not postgres_pool:
+            return
+        
+        try:
+            async with postgres_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO chat_memory (session_id, message_type, content)
+                    VALUES ($1, $2, $3)
+                """, session_id, message_type, content)
+        except Exception as e:
+            logger.error(f"Error saving chat message: {e}")
+    
+    @staticmethod
+    async def save_jira_ticket(user_id: str, ticket_key: str, summary: str, status: str = "Open"):
+        """Save Jira ticket to memory"""
+        if not postgres_pool:
+            return
+        
+        try:
+            async with postgres_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO jira_tickets (user_id, ticket_key, summary, status)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (ticket_key) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    updated_at = CURRENT_TIMESTAMP
+                """, user_id, ticket_key, summary, status)
+        except Exception as e:
+            logger.error(f"Error saving Jira ticket: {e}")
+    
+    @staticmethod
+    async def get_last_jira_ticket(user_id: str) -> Optional[Dict]:
+        """Get user's last Jira ticket"""
+        if not postgres_pool:
+            return None
+        
+        try:
+            async with postgres_pool.acquire() as conn:
+                row = await conn.fetchrow("""
+                    SELECT ticket_key, summary, status FROM jira_tickets 
+                    WHERE user_id = $1 
+                    ORDER BY created_at DESC 
+                    LIMIT 1
+                """, user_id)
+                
+                if row:
+                    return {
+                        "ticket_key": row["ticket_key"],
+                        "summary": row["summary"],
+                        "status": row["status"]
+                    }
+        except Exception as e:
+            logger.error(f"Error fetching last Jira ticket: {e}")
+        
+        return None
+
+class VectorSearch:
+    """Handle vector search operations"""
+    
+    @staticmethod
+    async def search_knowledge_base(query: str, limit: int = 3) -> List[Dict]:
+        """Search knowledge base using vector similarity"""
+        if not supabase_client or not embedding_model:
+            return []
+        
+        try:
+            # Generate embedding for query
+            query_embedding = embedding_model.encode(query).tolist()
+            
+            # Search in Supabase vector store
+            response = await supabase_client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/match_documents",
+                json={
+                    "query_embedding": query_embedding,
+                    "match_threshold": 0.7,
+                    "match_count": limit
+                }
+            )
+            
+            if response.status_code == 200:
+                results = response.json()
+                return [
+                    {
+                        "content": doc["content"],
+                        "metadata": doc["metadata"],
+                        "similarity": doc["similarity"]
+                    }
+                    for doc in results
+                ]
+        except Exception as e:
+            logger.error(f"Error in vector search: {e}")
+        
+        return []
+
+class JiraManager:
+    """Handle Jira operations"""
+    
+    @staticmethod
+    async def create_ticket(summary: str, description: str = "", issue_type: str = "Task") -> Dict[str, Any]:
+        """Create Jira ticket"""
         if not jira_client:
             return {"success": False, "error": "Jira not connected"}
         
         try:
-            # Get project details first
-            project_response = await jira_client.get(
-                f"{JIRA_URL}/rest/api/3/project/{ticket_data.project_key}"
-            )
-            
-            if project_response.status_code != 200:
-                return {"success": False, "error": "Project not found"}
-            
-            # Create ticket payload
             ticket_payload = {
                 "fields": {
-                    "project": {"key": ticket_data.project_key},
-                    "summary": ticket_data.summary,
+                    "project": {"id": "10000"},  # TEST BOARD from n8n workflow
+                    "summary": summary,
                     "description": {
                         "type": "doc",
                         "version": 1,
@@ -272,18 +379,16 @@ class JiraIntegration:
                                 "content": [
                                     {
                                         "type": "text",
-                                        "text": ticket_data.description
+                                        "text": description or summary
                                     }
                                 ]
                             }
                         ]
                     },
-                    "issuetype": {"name": ticket_data.issue_type},
-                    "priority": {"name": ticket_data.priority}
+                    "issuetype": {"id": "10003"},  # Task from n8n workflow
                 }
             }
             
-            # Create the ticket
             response = await jira_client.post(
                 f"{JIRA_URL}/rest/api/3/issue",
                 json=ticket_payload
@@ -291,180 +396,206 @@ class JiraIntegration:
             
             if response.status_code == 201:
                 ticket = response.json()
+                ticket_key = ticket["key"]
+                
                 return {
                     "success": True,
-                    "ticket_key": ticket["key"],
-                    "ticket_url": f"{JIRA_URL}/browse/{ticket['key']}"
+                    "ticket_key": ticket_key,
+                    "ticket_url": f"{JIRA_URL}/browse/{ticket_key}",
+                    "summary": summary
                 }
             else:
                 error_details = response.json() if response.status_code != 500 else {"error": "Server error"}
-                return {
-                    "success": False,
-                    "error": f"Failed to create ticket: {error_details}"
-                }
+                return {"success": False, "error": f"Failed to create ticket: {error_details}"}
                 
         except Exception as e:
-            logger.error(f"Error creating ticket: {e}")
+            logger.error(f"Error creating Jira ticket: {e}")
             return {"success": False, "error": str(e)}
     
     @staticmethod
-    async def get_issue_types(project_key: str) -> List[Dict[str, Any]]:
-        """Get available issue types for a project"""
+    async def get_ticket_status(ticket_key: str) -> Dict[str, Any]:
+        """Get Jira ticket status"""
         if not jira_client:
-            return []
+            return {"success": False, "error": "Jira not connected"}
         
         try:
-            response = await jira_client.get(
-                f"{JIRA_URL}/rest/api/3/issue/createmeta?projectKeys={project_key}&expand=projects.issuetypes"
-            )
+            response = await jira_client.get(f"{JIRA_URL}/rest/api/3/issue/{ticket_key}")
             
             if response.status_code == 200:
-                data = response.json()
-                if data.get("projects"):
-                    issue_types = data["projects"][0].get("issuetypes", [])
-                    return [
-                        {
-                            "id": issue_type["id"],
-                            "name": issue_type["name"],
-                            "description": issue_type.get("description", "")
-                        }
-                        for issue_type in issue_types
-                    ]
-            return []
+                issue = response.json()
+                return {
+                    "success": True,
+                    "ticket_key": ticket_key,
+                    "summary": issue["fields"]["summary"],
+                    "status": issue["fields"]["status"]["name"],
+                    "assignee": issue["fields"]["assignee"]["displayName"] if issue["fields"]["assignee"] else "Unassigned",
+                    "url": f"{JIRA_URL}/browse/{ticket_key}"
+                }
+            else:
+                return {"success": False, "error": "Ticket not found"}
+                
         except Exception as e:
-            logger.error(f"Error fetching issue types: {e}")
-            return []
+            logger.error(f"Error getting Jira ticket: {e}")
+            return {"success": False, "error": str(e)}
 
-class SlackAPI:
+class EnableBotAI:
+    """Main AI agent that processes messages"""
+    
     def __init__(self):
-        self.base_url = "https://slack.com/api"
-    
-    async def send_message(self, channel: str, text: str, thread_ts: str = None) -> bool:
-        """Send message to Slack channel"""
-        if not slack_client:
-            logger.error("Slack client not initialized")
-            return False
-        
-        try:
-            payload = {
-                "channel": channel,
-                "text": text
-            }
-            if thread_ts:
-                payload["thread_ts"] = thread_ts
-            
-            response = await slack_client.post(
-                f"{self.base_url}/chat.postMessage",
-                json=payload
-            )
-            
-            result = response.json()
-            if result.get("ok"):
-                logger.info(f"✅ Message sent to {channel}")
-                return True
-            else:
-                logger.error(f"❌ Slack API error: {result.get('error')}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error sending Slack message: {e}")
-            return False
-    
-    async def update_message(self, channel: str, ts: str, text: str) -> bool:
-        """Update existing message"""
-        if not slack_client:
-            return False
-        
-        try:
-            response = await slack_client.post(
-                f"{self.base_url}/chat.update",
-                json={
-                    "channel": channel,
-                    "ts": ts,
-                    "text": text
-                }
-            )
-            
-            result = response.json()
-            return result.get("ok", False)
-            
-        except Exception as e:
-            logger.error(f"Error updating message: {e}")
-            return False
+        self.system_prompt = """You are EnableOps Assistant, a helpful internal AI assistant.
 
-class TypingIndicator:
-    def __init__(self, slack_api: SlackAPI, channel: str):
-        self.slack_api = slack_api
-        self.channel = channel
-        self.message_ts = None
-        self.is_active = False
-    
-    async def start(self):
-        """Start typing indicator"""
+You help employees with topics such as HR, IT, onboarding, tool access, compliance, internal policies, and Jira support.
+
+You have access to an internal knowledge base via vector search. When users ask questions, always:
+1. Search the knowledge base using the vector database.
+2. If relevant context is found, include the most accurate, useful, and concise answer based on that information.
+3. If no relevant information is found, say so honestly and offer to help further.
+4. Check if the current question is related to any of the previous questions or answers, and respond accordingly.
+5. If the answer is not in the knowledge base, use your own LLM understanding to assist.
+
+You can also create Jira tickets for users. When a user reports an issue or requests support, create a Jira ticket and return:
+- A short confirmation message.
+- The Jira ticket ID (e.g. KAN-123).
+- A summary of what the ticket is about.
+
+Store the last created Jira ticket ID in memory, so if the user asks something like:
+- "Any update on my ticket?"
+- "What's the status of my last Jira request?"
+You can respond with the correct ID and redirect them to the Jira link if necessary.
+When responding with Jira ticket links, always use the format:
+https://surya-ai.atlassian.net/browse/{ticket_id} instead of API URLs.
+
+When listing ticket statuses, use the latest live data from the Jira status.name field. Do not rely on old or hardcoded transitions or assumptions.
+
+Always respond in clear and plain text without any special formatting, markdown, emojis, or symbols.
+
+Rules:
+- Only greet with "Hi {user_name}" if this is the first message in the session.
+- Keep answers professional, short, and easy to understand.
+- Do not include phrases like "Automated with n8n" in the response."""
+
+    async def process_message(self, user_profile: UserProfile, message: str, session_id: str) -> str:
+        """Process user message with context and tools"""
         try:
-            response = await slack_client.post(
-                "https://slack.com/api/chat.postMessage",
-                json={
-                    "channel": self.channel,
-                    "text": "🤔 Thinking..."
-                }
-            )
+            if not openai_client:
+                return "I'm sorry, but I'm not able to access my AI capabilities right now. Please try again later or contact your IT support."
+
+            # Get chat history
+            chat_history = await DatabaseManager.get_chat_history(session_id)
             
-            result = response.json()
-            if result.get("ok"):
-                self.message_ts = result["ts"]
-                self.is_active = True
-                
-                await asyncio.sleep(1)
-                if self.is_active:
-                    await self.slack_api.update_message(
-                        self.channel, 
-                        self.message_ts, 
-                        "⚡ Processing your request..."
-                    )
-                
-        except Exception as e:
-            logger.error(f"Error starting typing indicator: {e}")
-    
-    async def stop_and_respond(self, final_message: str):
-        """Replace typing indicator with final response"""
-        self.is_active = False
-        try:
-            if self.message_ts:
-                await self.slack_api.update_message(
-                    self.channel,
-                    self.message_ts,
-                    final_message
+            # Search knowledge base
+            knowledge_results = await VectorSearch.search_knowledge_base(message)
+            
+            # Check for ticket-related queries
+            last_ticket = await DatabaseManager.get_last_jira_ticket(user_profile.slack_user_id)
+            
+            # Build context
+            context_parts = []
+            
+            # Add user context
+            context_parts.append(f"""
+Here's who you're speaking with:
+- Name: {user_profile.full_name}
+- Role: {user_profile.role}
+- Department: {user_profile.department}
+- Location: {user_profile.location}
+- Tool Access: {', '.join(user_profile.tool_access)}
+""")
+            
+            # Add knowledge base results
+            if knowledge_results:
+                context_parts.append("Knowledge Base Results:")
+                for i, result in enumerate(knowledge_results, 1):
+                    context_parts.append(f"{i}. {result['content']}")
+            
+            # Add last ticket info
+            if last_ticket:
+                context_parts.append(f"User's last Jira ticket: {last_ticket['ticket_key']} - {last_ticket['summary']} (Status: {last_ticket['status']})")
+            
+            # Build messages
+            messages = [{"role": "system", "content": self.system_prompt}]
+            
+            # Add context
+            if context_parts:
+                messages.append({"role": "system", "content": "\n\n".join(context_parts)})
+            
+            # Add chat history
+            messages.extend(chat_history[-10:])  # Last 10 messages
+            
+            # Add current message
+            messages.append({"role": "user", "content": message})
+            
+            # Check if user wants to create a ticket
+            if await self._should_create_ticket(message):
+                ticket_result = await JiraManager.create_ticket(
+                    summary=f"Support request from {user_profile.full_name}",
+                    description=message
                 )
+                
+                if ticket_result["success"]:
+                    # Save ticket to memory
+                    await DatabaseManager.save_jira_ticket(
+                        user_profile.slack_user_id,
+                        ticket_result["ticket_key"],
+                        ticket_result["summary"]
+                    )
+                    
+                    response = f"I've created a Jira ticket for you: {ticket_result['ticket_key']}. You can track it here: {ticket_result['ticket_url']}"
+                else:
+                    response = f"I tried to create a Jira ticket but encountered an error: {ticket_result['error']}"
+            
+            # Check if user wants ticket status
+            elif await self._wants_ticket_status(message) and last_ticket:
+                status_result = await JiraManager.get_ticket_status(last_ticket["ticket_key"])
+                if status_result["success"]:
+                    response = f"Your ticket {status_result['ticket_key']} is currently {status_result['status']}. Assignee: {status_result['assignee']}. Link: {status_result['url']}"
+                else:
+                    response = f"I couldn't retrieve the status for ticket {last_ticket['ticket_key']}. Please check manually."
+            
             else:
-                await self.slack_api.send_message(self.channel, final_message)
+                # Generate AI response
+                completion = openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=messages,
+                    max_tokens=500,
+                    temperature=0.7
+                )
+                
+                response = completion.choices[0].message.content
+                
+                # Update usage stats
+                usage_stats["total_messages"] += 1
+                usage_stats["total_tokens"] += completion.usage.total_tokens
+                usage_stats["total_cost"] += completion.usage.total_tokens * 0.000075  # GPT-4o-mini pricing
+            
+            # Save conversation to memory
+            await DatabaseManager.save_chat_message(session_id, "human", message)
+            await DatabaseManager.save_chat_message(session_id, "ai", response)
+            
+            return response
+            
         except Exception as e:
-            logger.error(f"Error updating final message: {e}")
-            await self.slack_api.send_message(self.channel, final_message)
+            logger.error(f"Error processing message: {e}")
+            return "I encountered an error while processing your request. Please try again, and if the problem persists, contact your IT support team."
+    
+    async def _should_create_ticket(self, message: str) -> bool:
+        """Determine if message requires ticket creation"""
+        ticket_keywords = [
+            "create ticket", "create jira", "log ticket", "report issue", "submit request",
+            "need help", "broken", "not working", "error", "problem", "issue"
+        ]
+        return any(keyword in message.lower() for keyword in ticket_keywords)
+    
+    async def _wants_ticket_status(self, message: str) -> bool:
+        """Determine if user wants ticket status"""
+        status_keywords = [
+            "ticket status", "my ticket", "ticket update", "check ticket",
+            "jira status", "my request", "last ticket"
+        ]
+        return any(keyword in message.lower() for keyword in status_keywords)
 
 # Initialize components
 ai_agent = EnableBotAI()
-slack_api = SlackAPI()
-
-def update_usage_stats(tokens_used: int, cost: float):
-    """Update usage statistics"""
-    global usage_stats
-    today = datetime.now().strftime("%Y-%m-%d")
-    
-    usage_stats["total_messages"] += 1
-    usage_stats["total_tokens"] += tokens_used
-    usage_stats["total_cost"] += cost
-    
-    if today not in usage_stats["daily_usage"]:
-        usage_stats["daily_usage"][today] = {
-            "messages": 0,
-            "tokens": 0,
-            "cost": 0.0
-        }
-    
-    usage_stats["daily_usage"][today]["messages"] += 1
-    usage_stats["daily_usage"][today]["tokens"] += tokens_used
-    usage_stats["daily_usage"][today]["cost"] += cost
 
 def verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
     """Verify Slack request signature"""
@@ -484,1089 +615,453 @@ def verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
         logger.error(f"Error verifying signature: {e}")
         return False
 
-# Dashboard HTML with Jira Integration
+async def get_slack_user_info(user_id: str) -> Dict[str, Any]:
+    """Get Slack user information"""
+    if not slack_client:
+        return {}
+    
+    try:
+        response = await slack_client.get(f"https://slack.com/api/users.info?user={user_id}")
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("ok"):
+                return data.get("user", {})
+    except Exception as e:
+        logger.error(f"Error fetching Slack user info: {e}")
+    
+    return {}
+
+# Dashboard HTML (from previous version)
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EnableBot Dashboard</title>
+    <title>EnableBot SaaS Dashboard</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #F8FAFC;
-            color: #1E293B;
-            line-height: 1.5;
-        }
-
-        .dashboard-layout {
-            display: flex;
-            min-height: 100vh;
-        }
-
-        .sidebar {
-            width: 280px;
-            background: #FFFFFF;
-            border-right: 1px solid #E2E8F0;
-            box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
-            position: fixed;
-            height: 100vh;
-            overflow-y: auto;
-        }
-
-        .logo {
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            padding: 1.5rem 1.5rem 2rem;
-            font-size: 1.25rem;
-            font-weight: 600;
-            color: #1E293B;
-            border-bottom: 1px solid #F1F5F9;
-        }
-
-        .logo-icon {
-            width: 2rem;
-            height: 2rem;
-            background: linear-gradient(135deg, #3B82F6, #10B981);
-            border-radius: 0.5rem;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-size: 1rem;
-        }
-
-        .nav-menu {
-            padding: 1rem 0;
-        }
-
-        .nav-section {
-            margin-bottom: 2rem;
-        }
-
-        .nav-section-title {
-            padding: 0 1.5rem 0.5rem;
-            font-size: 0.75rem;
-            font-weight: 600;
-            color: #94A3B8;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-        }
-
-        .nav-item {
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            padding: 0.75rem 1.5rem;
-            font-size: 0.875rem;
-            font-weight: 500;
-            color: #64748B;
-            text-decoration: none;
-            transition: all 0.2s ease;
-            border-right: 3px solid transparent;
-            cursor: pointer;
-        }
-
-        .nav-item:hover {
-            background: #F8FAFC;
-            color: #1E293B;
-        }
-
-        .nav-item.active {
-            background: #F1F5F9;
-            color: #3B82F6;
-            border-right-color: #3B82F6;
-        }
-
-        .main-content {
-            flex: 1;
-            margin-left: 280px;
-            padding: 2rem;
-            max-width: calc(100vw - 280px);
-        }
-
-        .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 2rem;
-            padding-bottom: 1rem;
-            border-bottom: 1px solid #E2E8F0;
-        }
-
-        .header-title {
-            font-size: 2rem;
-            font-weight: 600;
-            color: #1E293B;
-        }
-
-        .header-subtitle {
-            font-size: 0.875rem;
-            color: #64748B;
-            margin-top: 0.25rem;
-        }
-
-        .btn {
-            padding: 0.75rem 1.5rem;
-            border-radius: 0.5rem;
-            font-size: 0.875rem;
-            font-weight: 500;
-            border: none;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .btn-primary {
-            background: #3B82F6;
-            color: #FFFFFF;
-        }
-
-        .btn-primary:hover {
-            background: #2563EB;
-        }
-
-        .btn-success {
-            background: #10B981;
-            color: #FFFFFF;
-        }
-
-        .btn-success:hover {
-            background: #059669;
-        }
-
-        .btn-secondary {
-            background: transparent;
-            color: #64748B;
-            border: 1px solid #E2E8F0;
-        }
-
-        .btn-secondary:hover {
-            background: #F8FAFC;
-            border-color: #CBD5E1;
-        }
-
-        .card {
-            background: #FFFFFF;
-            border-radius: 0.75rem;
-            box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
-            border: 1px solid #E2E8F0;
-            overflow: hidden;
-            margin-bottom: 1.5rem;
-        }
-
-        .card-header {
-            padding: 1.5rem 1.5rem 1rem;
-            border-bottom: 1px solid #F1F5F9;
-        }
-
-        .card-title {
-            font-size: 1.125rem;
-            font-weight: 600;
-            color: #1E293B;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .card-content {
-            padding: 1.5rem;
-        }
-
-        .form-group {
-            margin-bottom: 1rem;
-        }
-
-        .form-label {
-            display: block;
-            font-size: 0.875rem;
-            font-weight: 500;
-            color: #1E293B;
-            margin-bottom: 0.5rem;
-        }
-
-        .form-input {
-            width: 100%;
-            padding: 0.75rem 1rem;
-            border: 1px solid #E2E8F0;
-            border-radius: 0.5rem;
-            font-size: 0.875rem;
-            transition: border-color 0.2s ease;
-        }
-
-        .form-input:focus {
-            outline: none;
-            border-color: #3B82F6;
-            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-        }
-
-        .status-connected {
-            color: #10B981;
-            font-weight: 500;
-        }
-
-        .status-disconnected {
-            color: #EF4444;
-            font-weight: 500;
-        }
-
-        .section {
-            display: none;
-        }
-
-        .section.active {
-            display: block;
-        }
-
-        .grid {
-            display: grid;
-            gap: 1.5rem;
-        }
-
-        .grid-cols-2 {
-            grid-template-columns: repeat(2, 1fr);
-        }
-
-        .grid-cols-3 {
-            grid-template-columns: repeat(3, 1fr);
-        }
-
-        .alert {
-            padding: 1rem;
-            border-radius: 0.5rem;
-            margin-bottom: 1rem;
-        }
-
-        .alert-success {
-            background: #D1FAE5;
-            color: #065F46;
-            border: 1px solid #A7F3D0;
-        }
-
-        .alert-error {
-            background: #FEE2E2;
-            color: #991B1B;
-            border: 1px solid #FECACA;
-        }
-
-        .hidden {
-            display: none !important;
-        }
-
-        .modal {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.5);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-        }
-
-        .modal-content {
-            background: white;
-            padding: 2rem;
-            border-radius: 0.75rem;
-            max-width: 500px;
-            width: 90%;
-            max-height: 80vh;
-            overflow-y: auto;
-        }
-
-        .select {
-            width: 100%;
-            padding: 0.75rem 1rem;
-            border: 1px solid #E2E8F0;
-            border-radius: 0.5rem;
-            font-size: 0.875rem;
-            background: white;
-        }
-
-        .textarea {
-            width: 100%;
-            padding: 0.75rem 1rem;
-            border: 1px solid #E2E8F0;
-            border-radius: 0.5rem;
-            font-size: 0.875rem;
-            resize: vertical;
-            min-height: 100px;
-        }
-
-        @media (max-width: 768px) {
-            .main-content {
-                margin-left: 0;
-                max-width: 100vw;
-            }
-            
-            .sidebar {
-                transform: translateX(-100%);
-            }
-            
-            .grid-cols-2,
-            .grid-cols-3 {
-                grid-template-columns: 1fr;
-            }
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #F8FAFC; color: #1E293B; }
+        .dashboard { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+        .header { background: white; padding: 2rem; border-radius: 1rem; margin-bottom: 2rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .title { font-size: 2rem; font-weight: 700; color: #1E293B; margin-bottom: 0.5rem; }
+        .subtitle { color: #64748B; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; }
+        .card { background: white; padding: 1.5rem; border-radius: 0.75rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .card h3 { font-size: 1.125rem; font-weight: 600; margin-bottom: 1rem; }
+        .metric { display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 0; border-bottom: 1px solid #F1F5F9; }
+        .metric:last-child { border-bottom: none; }
+        .metric-value { font-weight: 600; color: #059669; }
+        .status-connected { color: #059669; }
+        .status-disconnected { color: #DC2626; }
+        .btn { padding: 0.75rem 1.5rem; border: none; border-radius: 0.5rem; font-weight: 500; cursor: pointer; transition: all 0.2s; }
+        .btn-primary { background: #3B82F6; color: white; }
+        .btn-primary:hover { background: #2563EB; }
     </style>
 </head>
 <body>
-    <div class="dashboard-layout">
-        <!-- Sidebar -->
-        <nav class="sidebar">
-            <div class="logo">
-                <div class="logo-icon">🤖</div>
-                <span>EnableBot</span>
+    <div class="dashboard">
+        <div class="header">
+            <h1 class="title">🤖 EnableBot SaaS Dashboard</h1>
+            <p class="subtitle">Complete AI assistant with Slack, Jira, Vector Search & User Management</p>
+        </div>
+        
+        <div class="grid">
+            <div class="card">
+                <h3>🔧 System Status</h3>
+                <div class="metric">
+                    <span>OpenAI</span>
+                    <span id="openaiStatus" class="status-disconnected">Loading...</span>
+                </div>
+                <div class="metric">
+                    <span>Slack</span>
+                    <span id="slackStatus" class="status-disconnected">Loading...</span>
+                </div>
+                <div class="metric">
+                    <span>Supabase</span>
+                    <span id="supabaseStatus" class="status-disconnected">Loading...</span>
+                </div>
+                <div class="metric">
+                    <span>PostgreSQL</span>
+                    <span id="postgresStatus" class="status-disconnected">Loading...</span>
+                </div>
+                <div class="metric">
+                    <span>Jira</span>
+                    <span id="jiraStatus" class="status-disconnected">Loading...</span>
+                </div>
             </div>
             
-            <div class="nav-menu">
-                <div class="nav-section">
-                    <div class="nav-section-title">Overview</div>
-                    <div class="nav-item active" onclick="showSection('dashboard')">
-                        <span>📊</span>
-                        Dashboard
-                    </div>
+            <div class="card">
+                <h3>📊 Usage Stats</h3>
+                <div class="metric">
+                    <span>Total Messages</span>
+                    <span id="totalMessages" class="metric-value">0</span>
                 </div>
-                
-                <div class="nav-section">
-                    <div class="nav-section-title">Operations</div>
-                    <div class="nav-item" onclick="showSection('conversations')">
-                        <span>💬</span>
-                        Test Chat
-                    </div>
-                    <div class="nav-item" onclick="showSection('jira')">
-                        <span>🎫</span>
-                        Jira Tickets
-                    </div>
+                <div class="metric">
+                    <span>Total Tokens</span>
+                    <span id="totalTokens" class="metric-value">0</span>
                 </div>
-                
-                <div class="nav-section">
-                    <div class="nav-section-title">Configuration</div>
-                    <div class="nav-item" onclick="showSection('integrations')">
-                        <span>🔗</span>
-                        Integrations
-                    </div>
+                <div class="metric">
+                    <span>Total Cost</span>
+                    <span id="totalCost" class="metric-value">$0.00</span>
                 </div>
             </div>
-        </nav>
-
-        <!-- Main Content -->
-        <main class="main-content">
-            <div class="header">
-                <div>
-                    <h1 class="header-title" id="pageTitle">Dashboard</h1>
-                    <p class="header-subtitle">Monitor and manage your AI assistant</p>
-                </div>
-                <div>
-                    <button class="btn btn-secondary" onclick="refreshStats()">
-                        <span>🔄</span> Refresh
-                    </button>
-                </div>
-            </div>
-
-            <!-- Dashboard Section -->
-            <div id="dashboard" class="section active">
-                <div class="card">
-                    <div class="card-header">
-                        <h3 class="card-title">🔧 System Status</h3>
-                    </div>
-                    <div class="card-content">
-                        <div class="grid grid-cols-3">
-                            <div>
-                                <strong>OpenAI:</strong>
-                                <span id="openaiStatus" class="status-disconnected">Loading...</span>
-                            </div>
-                            <div>
-                                <strong>Slack:</strong>
-                                <span id="slackStatus" class="status-disconnected">Loading...</span>
-                            </div>
-                            <div>
-                                <strong>Jira:</strong>
-                                <span id="jiraStatus" class="status-disconnected">Loading...</span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Conversations Section -->
-            <div id="conversations" class="section">
-                <div class="card">
-                    <div class="card-header">
-                        <h3 class="card-title">💬 Test Conversation</h3>
-                    </div>
-                    <div class="card-content">
-                        <div id="chatMessages" style="height: 400px; overflow-y: auto; border: 1px solid #E2E8F0; padding: 1rem; margin-bottom: 1rem; border-radius: 0.5rem;">
-                            <div style="margin-bottom: 1rem;">
-                                <strong>EnableBot:</strong> Hello! I'm your EnableOps Assistant. How can I help you today?
-                            </div>
-                        </div>
-                        <div style="display: flex; gap: 0.75rem;">
-                            <input type="text" id="messageInput" class="form-input" style="flex: 1;" 
-                                   placeholder="Type your message..." onkeypress="handleKeyPress(event)">
-                            <button class="btn btn-primary" onclick="sendMessage()">Send</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Jira Section -->
-            <div id="jira" class="section">
-                <div class="card">
-                    <div class="card-header">
-                        <h3 class="card-title">🎫 Jira Integration</h3>
-                    </div>
-                    <div class="card-content">
-                        <div id="jiraConnectionStatus">
-                            <p>Jira Status: <span id="jiraConnectionText" class="status-disconnected">Not Connected</span></p>
-                            <button id="connectJiraBtn" class="btn btn-primary" onclick="showJiraConnectionModal()">
-                                <span>🔗</span> Connect to Jira
-                            </button>
-                        </div>
-
-                        <div id="jiraConnectedContent" class="hidden">
-                            <div class="grid grid-cols-2">
-                                <div>
-                                    <h4>Create New Ticket</h4>
-                                    <button class="btn btn-success" onclick="showCreateTicketModal()">
-                                        <span>➕</span> Create Ticket
-                                    </button>
-                                </div>
-                                <div>
-                                    <h4>Projects Available</h4>
-                                    <div id="projectsList"></div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Integrations Section -->
-            <div id="integrations" class="section">
-                <div class="card">
-                    <div class="card-header">
-                        <h3 class="card-title">🔗 Service Integrations</h3>
-                    </div>
-                    <div class="card-content">
-                        <div class="grid grid-cols-2">
-                            <div class="card">
-                                <div class="card-content">
-                                    <h4>🤖 OpenAI</h4>
-                                    <p>Status: <span id="openaiIntegrationStatus">Loading...</span></p>
-                                    <p style="font-size: 0.875rem; color: #64748B;">AI language model for responses</p>
-                                </div>
-                            </div>
-
-                            <div class="card">
-                                <div class="card-content">
-                                    <h4>💬 Slack</h4>
-                                    <p>Status: <span id="slackIntegrationStatus">Loading...</span></p>
-                                    <p style="font-size: 0.875rem; color: #64748B;">Team communication platform</p>
-                                </div>
-                            </div>
-
-                            <div class="card">
-                                <div class="card-content">
-                                    <h4>🎫 Jira</h4>
-                                    <p>Status: <span id="jiraIntegrationStatus">Not Connected</span></p>
-                                    <p style="font-size: 0.875rem; color: #64748B;">Issue tracking and project management</p>
-                                    <button class="btn btn-primary" onclick="showJiraConnectionModal()" style="margin-top: 1rem;">
-                                        Connect Jira
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </main>
-    </div>
-
-    <!-- Jira Connection Modal -->
-    <div id="jiraConnectionModal" class="modal hidden">
-        <div class="modal-content">
-            <h3 style="margin-bottom: 1rem;">Connect to Jira</h3>
             
-            <div id="connectionAlert" class="hidden"></div>
+            <div class="card">
+                <h3>🎫 Jira Integration</h3>
+                <div class="metric">
+                    <span>Status</span>
+                    <span id="jiraIntegrationStatus" class="status-disconnected">Not Connected</span>
+                </div>
+                <button class="btn btn-primary" onclick="testJiraConnection()">Test Connection</button>
+            </div>
             
-            <form id="jiraConnectionForm">
-                <div class="form-group">
-                    <label class="form-label">Jira URL</label>
-                    <input type="url" id="jiraUrlInput" class="form-input" 
-                           placeholder="https://your-company.atlassian.net" required>
+            <div class="card">
+                <h3>🔍 Vector Search</h3>
+                <div class="metric">
+                    <span>Embedding Model</span>
+                    <span id="embeddingStatus" class="status-disconnected">Loading...</span>
                 </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Email Address</label>
-                    <input type="email" id="jiraEmailInput" class="form-input" 
-                           placeholder="your-email@company.com" required>
+                <div class="metric">
+                    <span>Knowledge Base</span>
+                    <span id="knowledgeBaseStatus" class="status-disconnected">Loading...</span>
                 </div>
-                
-                <div class="form-group">
-                    <label class="form-label">API Token</label>
-                    <input type="password" id="jiraTokenInput" class="form-input" 
-                           placeholder="Your Jira API token" required>
-                    <small style="color: #64748B; font-size: 0.75rem;">
-                        Generate an API token in your Jira account settings
-                    </small>
-                </div>
-                
-                <div style="display: flex; gap: 0.75rem; margin-top: 1.5rem;">
-                    <button type="submit" class="btn btn-primary">
-                        <span id="connectButtonText">Connect</span>
-                    </button>
-                    <button type="button" class="btn btn-secondary" onclick="hideJiraConnectionModal()">
-                        Cancel
-                    </button>
-                </div>
-            </form>
+            </div>
         </div>
     </div>
-
-    <!-- Create Ticket Modal -->
-    <div id="createTicketModal" class="modal hidden">
-        <div class="modal-content">
-            <h3 style="margin-bottom: 1rem;">Create Jira Ticket</h3>
-            
-            <div id="ticketAlert" class="hidden"></div>
-            
-            <form id="createTicketForm">
-                <div class="form-group">
-                    <label class="form-label">Project</label>
-                    <select id="projectSelect" class="select" required>
-                        <option value="">Select a project...</option>
-                    </select>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Issue Type</label>
-                    <select id="issueTypeSelect" class="select" required>
-                        <option value="Task">Task</option>
-                        <option value="Bug">Bug</option>
-                        <option value="Story">Story</option>
-                        <option value="Epic">Epic</option>
-                    </select>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Summary</label>
-                    <input type="text" id="ticketSummary" class="form-input" 
-                           placeholder="Brief description of the issue" required>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Description</label>
-                    <textarea id="ticketDescription" class="textarea" 
-                              placeholder="Detailed description of the issue" required></textarea>
-                </div>
-                
-                <div class="form-group">
-                    <label class="form-label">Priority</label>
-                    <select id="prioritySelect" class="select">
-                        <option value="Low">Low</option>
-                        <option value="Medium" selected>Medium</option>
-                        <option value="High">High</option>
-                        <option value="Highest">Highest</option>
-                    </select>
-                </div>
-                
-                <div style="display: flex; gap: 0.75rem; margin-top: 1.5rem;">
-                    <button type="submit" class="btn btn-success">
-                        <span id="createButtonText">Create Ticket</span>
-                    </button>
-                    <button type="button" class="btn btn-secondary" onclick="hideCreateTicketModal()">
-                        Cancel
-                    </button>
-                </div>
-            </form>
-        </div>
-    </div>
-
+    
     <script>
-        let jiraConnected = false;
-
-        function showSection(sectionName) {
-            // Hide all sections
-            document.querySelectorAll('.section').forEach(section => {
-                section.classList.remove('active');
-            });
-            
-            // Remove active class from all nav items
-            document.querySelectorAll('.nav-item').forEach(item => {
-                item.classList.remove('active');
-            });
-            
-            // Show selected section
-            const section = document.getElementById(sectionName);
-            if (section) {
-                section.classList.add('active');
-            }
-            
-            // Add active class to clicked nav item
-            event.target.classList.add('active');
-            
-            // Update header title
-            const pageTitle = document.getElementById('pageTitle');
-            pageTitle.textContent = sectionName.charAt(0).toUpperCase() + sectionName.slice(1);
-        }
-
         async function refreshStats() {
             try {
                 const response = await fetch('/health');
                 const data = await response.json();
                 
-                // Update status indicators
-                updateStatusIndicator('openaiStatus', data.services.openai);
-                updateStatusIndicator('slackStatus', data.services.slack);
-                updateStatusIndicator('jiraStatus', data.services.jira || jiraConnected);
+                document.getElementById('openaiStatus').textContent = data.services.openai ? 'Connected' : 'Disconnected';
+                document.getElementById('openaiStatus').className = data.services.openai ? 'status-connected' : 'status-disconnected';
                 
-                // Update integration status
-                updateStatusIndicator('openaiIntegrationStatus', data.services.openai);
-                updateStatusIndicator('slackIntegrationStatus', data.services.slack);
-                updateStatusIndicator('jiraIntegrationStatus', data.services.jira || jiraConnected);
+                document.getElementById('slackStatus').textContent = data.services.slack ? 'Connected' : 'Disconnected';
+                document.getElementById('slackStatus').className = data.services.slack ? 'status-connected' : 'status-disconnected';
+                
+                document.getElementById('supabaseStatus').textContent = data.services.supabase ? 'Connected' : 'Disconnected';
+                document.getElementById('supabaseStatus').className = data.services.supabase ? 'status-connected' : 'status-disconnected';
+                
+                document.getElementById('postgresStatus').textContent = data.services.postgres ? 'Connected' : 'Disconnected';
+                document.getElementById('postgresStatus').className = data.services.postgres ? 'status-connected' : 'status-disconnected';
+                
+                document.getElementById('jiraStatus').textContent = data.services.jira ? 'Connected' : 'Disconnected';
+                document.getElementById('jiraStatus').className = data.services.jira ? 'status-connected' : 'status-disconnected';
+                
+                document.getElementById('embeddingStatus').textContent = data.services.embedding ? 'Connected' : 'Disconnected';
+                document.getElementById('embeddingStatus').className = data.services.embedding ? 'status-connected' : 'status-disconnected';
+                
+                document.getElementById('knowledgeBaseStatus').textContent = data.services.supabase ? 'Connected' : 'Disconnected';
+                document.getElementById('knowledgeBaseStatus').className = data.services.supabase ? 'status-connected' : 'status-disconnected';
+                
+                document.getElementById('jiraIntegrationStatus').textContent = data.services.jira ? 'Connected' : 'Not Connected';
+                document.getElementById('jiraIntegrationStatus').className = data.services.jira ? 'status-connected' : 'status-disconnected';
+                
+                // Update usage stats
+                document.getElementById('totalMessages').textContent = data.usage.total_messages.toLocaleString();
+                document.getElementById('totalTokens').textContent = data.usage.total_tokens.toLocaleString();
+                document.getElementById('totalCost').textContent = `${data.usage.total_cost.toFixed(2)}`;
                 
             } catch (error) {
                 console.error('Failed to refresh stats:', error);
             }
         }
-
-        function updateStatusIndicator(elementId, isConnected) {
-            const element = document.getElementById(elementId);
-            if (element) {
-                element.textContent = isConnected ? 'Connected' : 'Disconnected';
-                element.className = isConnected ? 'status-connected' : 'status-disconnected';
-            }
-        }
-
-        function showJiraConnectionModal() {
-            document.getElementById('jiraConnectionModal').classList.remove('hidden');
-        }
-
-        function hideJiraConnectionModal() {
-            document.getElementById('jiraConnectionModal').classList.add('hidden');
-            document.getElementById('connectionAlert').classList.add('hidden');
-        }
-
-        function showCreateTicketModal() {
-            document.getElementById('createTicketModal').classList.remove('hidden');
-            loadProjects();
-        }
-
-        function hideCreateTicketModal() {
-            document.getElementById('createTicketModal').classList.add('hidden');
-            document.getElementById('ticketAlert').classList.add('hidden');
-        }
-
-        async function loadProjects() {
+        
+        async function testJiraConnection() {
             try {
-                const response = await fetch('/jira/projects');
-                const projects = await response.json();
-                
-                const projectSelect = document.getElementById('projectSelect');
-                projectSelect.innerHTML = '<option value="">Select a project...</option>';
-                
-                projects.forEach(project => {
-                    const option = document.createElement('option');
-                    option.value = project.key;
-                    option.textContent = `${project.key} - ${project.name}`;
-                    projectSelect.appendChild(option);
-                });
-            } catch (error) {
-                console.error('Failed to load projects:', error);
-            }
-        }
-
-        // Jira Connection Form Handler
-        document.getElementById('jiraConnectionForm').addEventListener('submit', async function(e) {
-            e.preventDefault();
-            
-            const connectButton = document.getElementById('connectButtonText');
-            const originalText = connectButton.textContent;
-            connectButton.textContent = 'Connecting...';
-            
-            const formData = {
-                jira_url: document.getElementById('jiraUrlInput').value,
-                email: document.getElementById('jiraEmailInput').value,
-                api_token: document.getElementById('jiraTokenInput').value
-            };
-            
-            try {
-                const response = await fetch('/jira/connect', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(formData)
-                });
-                
+                const response = await fetch('/jira/test-connection');
                 const result = await response.json();
-                const alertDiv = document.getElementById('connectionAlert');
-                
-                if (result.success) {
-                    alertDiv.className = 'alert alert-success';
-                    alertDiv.textContent = `Successfully connected as ${result.user}`;
-                    alertDiv.classList.remove('hidden');
-                    
-                    // Update UI
-                    jiraConnected = true;
-                    document.getElementById('jiraConnectionText').textContent = 'Connected';
-                    document.getElementById('jiraConnectionText').className = 'status-connected';
-                    document.getElementById('connectJiraBtn').textContent = '✅ Connected to Jira';
-                    document.getElementById('jiraConnectedContent').classList.remove('hidden');
-                    
-                    // Hide modal after delay
-                    setTimeout(() => {
-                        hideJiraConnectionModal();
-                        refreshStats();
-                    }, 2000);
-                } else {
-                    alertDiv.className = 'alert alert-error';
-                    alertDiv.textContent = `Connection failed: ${result.error}`;
-                    alertDiv.classList.remove('hidden');
-                }
+                alert(result.success ? 'Jira connection successful!' : `Connection failed: ${result.error}`);
             } catch (error) {
-                const alertDiv = document.getElementById('connectionAlert');
-                alertDiv.className = 'alert alert-error';
-                alertDiv.textContent = `Connection error: ${error.message}`;
-                alertDiv.classList.remove('hidden');
-            }
-            
-            connectButton.textContent = originalText;
-        });
-
-        // Create Ticket Form Handler
-        document.getElementById('createTicketForm').addEventListener('submit', async function(e) {
-            e.preventDefault();
-            
-            const createButton = document.getElementById('createButtonText');
-            const originalText = createButton.textContent;
-            createButton.textContent = 'Creating...';
-            
-            const ticketData = {
-                project_key: document.getElementById('projectSelect').value,
-                issue_type: document.getElementById('issueTypeSelect').value,
-                summary: document.getElementById('ticketSummary').value,
-                description: document.getElementById('ticketDescription').value,
-                priority: document.getElementById('prioritySelect').value
-            };
-            
-            try {
-                const response = await fetch('/jira/create-ticket', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(ticketData)
-                });
-                
-                const result = await response.json();
-                const alertDiv = document.getElementById('ticketAlert');
-                
-                if (result.success) {
-                    alertDiv.className = 'alert alert-success';
-                    alertDiv.innerHTML = `Ticket created successfully! <a href="${result.ticket_url}" target="_blank">${result.ticket_key}</a>`;
-                    alertDiv.classList.remove('hidden');
-                    
-                    // Reset form
-                    document.getElementById('createTicketForm').reset();
-                    
-                    setTimeout(() => {
-                        hideCreateTicketModal();
-                    }, 3000);
-                } else {
-                    alertDiv.className = 'alert alert-error';
-                    alertDiv.textContent = `Failed to create ticket: ${result.error}`;
-                    alertDiv.classList.remove('hidden');
-                }
-            } catch (error) {
-                const alertDiv = document.getElementById('ticketAlert');
-                alertDiv.className = 'alert alert-error';
-                alertDiv.textContent = `Error creating ticket: ${error.message}`;
-                alertDiv.classList.remove('hidden');
-            }
-            
-            createButton.textContent = originalText;
-        });
-
-        async function sendMessage() {
-            const input = document.getElementById('messageInput');
-            const message = input.value.trim();
-            
-            if (!message) return;
-            
-            const chatMessages = document.getElementById('chatMessages');
-            
-            // Add user message
-            const userDiv = document.createElement('div');
-            userDiv.style.marginBottom = '1rem';
-            userDiv.innerHTML = `<strong>You:</strong> ${message}`;
-            chatMessages.appendChild(userDiv);
-            
-            input.value = '';
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-            
-            try {
-                const response = await fetch('/test-ai', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ message, user_id: 'dashboard_user' })
-                });
-                
-                const data = await response.json();
-                
-                // Add bot response
-                const botDiv = document.createElement('div');
-                botDiv.style.marginBottom = '1rem';
-                botDiv.innerHTML = `<strong>EnableBot:</strong> ${data.ai_response}`;
-                chatMessages.appendChild(botDiv);
-                
-            } catch (error) {
-                const errorDiv = document.createElement('div');
-                errorDiv.style.marginBottom = '1rem';
-                errorDiv.innerHTML = `<strong>EnableBot:</strong> Sorry, I encountered an error.`;
-                chatMessages.appendChild(errorDiv);
-            }
-            
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
-
-        function handleKeyPress(event) {
-            if (event.key === 'Enter') {
-                sendMessage();
+                alert(`Connection test failed: ${error.message}`);
             }
         }
-
-        // Initialize
+        
+        // Auto refresh every 30 seconds
+        setInterval(refreshStats, 30000);
         refreshStats();
     </script>
 </body>
 </html>
 """
 
+# API Routes
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database connections on startup"""
+    await DatabaseManager.init_postgres()
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    """Serve the dashboard"""
+    """Serve the main dashboard"""
     return DASHBOARD_HTML
 
 @app.get("/health")
 async def health_check():
-    """Enhanced health check endpoint"""
+    """Enhanced health check with all services"""
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "services": {
             "openai": bool(openai_client),
             "slack": bool(slack_client),
-            "jira": bool(jira_client)
+            "supabase": bool(supabase_client),
+            "postgres": bool(postgres_pool),
+            "jira": bool(jira_client),
+            "embedding": bool(embedding_model)
         },
+        "usage": usage_stats,
         "memory": {
-            "active_conversations": len(chat_memory),
-            "typing_indicators": len(typing_tasks)
+            "active_sessions": len(chat_sessions)
         }
     }
 
-@app.post("/jira/connect")
-async def connect_jira_endpoint(connection_data: JiraConnectionRequest):
-    """Connect to Jira with provided credentials"""
-    global jira_client, JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN
-    
-    try:
-        # Test connection
-        result = await JiraIntegration.test_connection(
-            connection_data.jira_url,
-            connection_data.email,
-            connection_data.api_token
-        )
-        
-        if result["success"]:
-            # Update global variables
-            JIRA_URL = connection_data.jira_url.rstrip('/')
-            JIRA_EMAIL = connection_data.email
-            JIRA_API_TOKEN = connection_data.api_token
-            
-            # Reinitialize Jira client
-            auth_string = f"{JIRA_EMAIL}:{JIRA_API_TOKEN}"
-            encoded_auth = base64.b64encode(auth_string.encode()).decode()
-            
-            jira_client = httpx.AsyncClient(
-                headers={
-                    "Authorization": f"Basic {encoded_auth}",
-                    "Accept": "application/json",
-                    "Content-Type": "application/json"
-                },
-                timeout=30.0
-            )
-            
-            logger.info(f"✅ Jira connected successfully for {result['user']}")
-            
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error connecting to Jira: {e}")
-        return {"success": False, "error": str(e)}
-
-@app.get("/jira/projects")
-async def get_jira_projects():
-    """Get available Jira projects"""
-    if not jira_client:
-        raise HTTPException(status_code=400, detail="Jira not connected")
-    
-    projects = await JiraIntegration.get_projects()
-    return projects
-
-@app.post("/jira/create-ticket")
-async def create_jira_ticket(ticket_data: JiraTicketRequest):
-    """Create a new Jira ticket"""
-    if not jira_client:
-        raise HTTPException(status_code=400, detail="Jira not connected")
-    
-    result = await JiraIntegration.create_ticket(ticket_data)
-    
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail=result["error"])
-    
-    logger.info(f"✅ Jira ticket created: {result['ticket_key']}")
-    return result
-
-@app.get("/jira/issue-types/{project_key}")
-async def get_issue_types(project_key: str):
-    """Get available issue types for a project"""
-    if not jira_client:
-        raise HTTPException(status_code=400, detail="Jira not connected")
-    
-    issue_types = await JiraIntegration.get_issue_types(project_key)
-    return issue_types
-
-@app.post("/slack/events")
-async def handle_slack_events(request: Request):
-    """Handle Slack events via HTTP webhooks"""
+@app.post("/enable-bot")
+async def handle_slack_webhook(request: Request):
+    """Main webhook endpoint that mirrors n8n workflow"""
     try:
         body = await request.body()
         headers = request.headers
         
+        # Parse JSON
         try:
             data = json.loads(body.decode())
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON: {e}")
+        except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON")
         
-        # Handle URL verification
+        # Handle URL verification (Code4 + Respond to Webhook in n8n)
         if data.get("type") == "url_verification":
-            challenge = data.get("challenge")
-            logger.info(f"✅ URL verification challenge: {challenge}")
-            return JSONResponse({"challenge": challenge})
+            return JSONResponse({"challenge": data.get("challenge")})
         
-        # Verify signature
+        # Verify Slack signature
         if SLACK_SIGNING_SECRET:
             timestamp = headers.get("x-slack-request-timestamp")
             signature = headers.get("x-slack-signature")
-            
             if not verify_slack_signature(body, timestamp, signature):
-                logger.error("❌ Invalid Slack signature")
                 raise HTTPException(status_code=401, detail="Invalid signature")
         
-        # Handle events
-        if data.get("type") == "event_callback":
-            event = data.get("event", {})
-            
-            # Skip bot messages
-            if (event.get("bot_id") or 
-                event.get("subtype") in ["bot_message", "file_share", "message_changed"]):
-                return JSONResponse({"status": "ignored"})
-            
-            if event.get("type") == "message":
-                channel = event.get("channel")
-                user = event.get("user")
-                text = event.get("text", "").strip()
-                
-                if all([channel, user, text]):
-                    asyncio.create_task(process_slack_message(channel, user, text))
+        # Process event (Code2 - Bot loop detection)
+        event = data.get("event", {})
+        if event.get("bot_id") or event.get("user") == "U093TKM24AH":
+            return JSONResponse({"status": "ignored"})  # Stop workflow for bot messages
+        
+        # Extract data (Code1)
+        slack_user_id = event.get("user")
+        channel = event.get("channel")
+        text = event.get("text", "")
+        
+        if not all([slack_user_id, channel, text]):
+            return JSONResponse({"status": "ignored"})
+        
+        # Get Slack user info (HTTP Request)
+        slack_user_info = await get_slack_user_info(slack_user_id)
+        
+        # Get user profile from Supabase
+        user_profile = await DatabaseManager.get_user_profile(slack_user_id)
+        
+        if not user_profile:
+            # Create default profile if not found
+            user_profile = UserProfile(
+                slack_user_id=slack_user_id,
+                full_name=slack_user_info.get("real_name", "Unknown User"),
+                role="Employee",
+                department="General",
+                location="Remote",
+                tool_access=[]
+            )
+        
+        # Generate session ID (Code)
+        session_id = f"slack-{slack_user_id}"
+        
+        # Process with AI Agent
+        ai_response = await ai_agent.process_message(user_profile, text, session_id)
+        
+        # Send response to Slack (Code3 + Send a message)
+        if slack_client:
+            await slack_client.post(
+                "https://slack.com/api/chat.postMessage",
+                json={
+                    "channel": channel,
+                    "text": ai_response
+                }
+            )
         
         return JSONResponse({"status": "ok"})
         
     except Exception as e:
-        logger.error(f"Error handling Slack event: {e}")
+        logger.error(f"Error in webhook: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-async def process_slack_message(channel: str, user: str, text: str):
-    """Process Slack message with typing indicator"""
+@app.post("/jira/test-connection")
+async def test_jira_connection():
+    """Test Jira connection"""
+    if not jira_client:
+        return {"success": False, "error": "Jira not configured"}
+    
     try:
-        typing = TypingIndicator(slack_api, channel)
-        typing_tasks[f"{channel}_{user}"] = typing
-        
-        await typing.start()
-        
-        # Generate AI response
-        ai_response = await ai_agent.process_message(user, text)
-        
-        # Send final response
-        await typing.stop_and_respond(ai_response)
-        
-        # Clean up
-        if f"{channel}_{user}" in typing_tasks:
-            del typing_tasks[f"{channel}_{user}"]
-        
-        logger.info(f"✅ Processed message from {user} in {channel}")
-        
+        response = await jira_client.get(f"{JIRA_URL}/rest/api/3/myself")
+        if response.status_code == 200:
+            user_info = response.json()
+            return {
+                "success": True,
+                "user": user_info.get("displayName", "Unknown"),
+                "email": user_info.get("emailAddress", "")
+            }
+        else:
+            return {"success": False, "error": f"HTTP {response.status_code}"}
     except Exception as e:
-        logger.error(f"Error processing message: {e}")
-        await slack_api.send_message(
-            channel, 
-            "I'm sorry, I encountered an error processing your message. Please try again."
-        )
+        return {"success": False, "error": str(e)}
 
-@app.post("/test-ai")
-async def test_ai(request: Request):
-    """Test AI functionality directly"""
+@app.post("/jira/create-ticket")
+async def create_jira_ticket_api(ticket_data: JiraTicketRequest):
+    """Create Jira ticket via API"""
+    result = await JiraManager.create_ticket(
+        ticket_data.summary,
+        ticket_data.description,
+        ticket_data.issue_type
+    )
+    
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    
+    return result
+
+@app.get("/jira/ticket/{ticket_key}")
+async def get_jira_ticket_api(ticket_key: str):
+    """Get Jira ticket status via API"""
+    result = await JiraManager.get_ticket_status(ticket_key)
+    
+    if not result["success"]:
+        raise HTTPException(status_code=404, detail=result["error"])
+    
+    return result
+
+@app.post("/vector-search")
+async def vector_search_api(query: str, limit: int = 5):
+    """Search knowledge base via API"""
+    results = await VectorSearch.search_knowledge_base(query, limit)
+    return {"results": results}
+
+@app.get("/user-profile/{slack_user_id}")
+async def get_user_profile_api(slack_user_id: str):
+    """Get user profile via API"""
+    profile = await DatabaseManager.get_user_profile(slack_user_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+    return profile
+
+@app.post("/chat/test")
+async def test_chat_api(message: str, user_id: str = "test_user"):
+    """Test chat functionality"""
+    if not openai_client:
+        raise HTTPException(status_code=503, detail="OpenAI not available")
+    
+    # Create test user profile
+    test_profile = UserProfile(
+        slack_user_id=user_id,
+        full_name="Test User",
+        role="Developer",
+        department="Engineering",
+        location="Remote",
+        tool_access=["Slack", "Jira", "GitHub"]
+    )
+    
+    session_id = f"test-{user_id}"
+    response = await ai_agent.process_message(test_profile, message, session_id)
+    
+    return {
+        "user_input": message,
+        "ai_response": response,
+        "session_id": session_id,
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/chat/history/{session_id}")
+async def get_chat_history_api(session_id: str, limit: int = 20):
+    """Get chat history for a session"""
+    history = await DatabaseManager.get_chat_history(session_id, limit)
+    return {"session_id": session_id, "history": history}
+
+@app.delete("/chat/reset/{session_id}")
+async def reset_chat_session(session_id: str):
+    """Reset chat session"""
+    if postgres_pool:
+        try:
+            async with postgres_pool.acquire() as conn:
+                await conn.execute("DELETE FROM chat_memory WHERE session_id = $1", session_id)
+            return {"status": "reset", "session_id": session_id}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+@app.get("/stats/usage")
+async def get_usage_stats():
+    """Get detailed usage statistics"""
+    if postgres_pool:
+        try:
+            async with postgres_pool.acquire() as conn:
+                # Get message counts by day
+                daily_stats = await conn.fetch("""
+                    SELECT DATE(created_at) as date, COUNT(*) as messages
+                    FROM chat_memory 
+                    WHERE message_type = 'human'
+                    GROUP BY DATE(created_at)
+                    ORDER BY date DESC
+                    LIMIT 30
+                """)
+                
+                # Get total tickets created
+                ticket_count = await conn.fetchval("SELECT COUNT(*) FROM jira_tickets")
+                
+                return {
+                    "usage_stats": usage_stats,
+                    "daily_stats": [dict(row) for row in daily_stats],
+                    "total_tickets": ticket_count or 0
+                }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    return {"usage_stats": usage_stats}
+
+@app.post("/admin/sync-users")
+async def sync_users_from_slack():
+    """Sync users from Slack to Supabase (admin endpoint)"""
+    if not slack_client or not supabase_client:
+        raise HTTPException(status_code=503, detail="Required services not available")
+    
     try:
-        if not openai_client:
-            raise HTTPException(
-                status_code=503, 
-                detail="OpenAI service not available. Please check API key."
-            )
+        # Get Slack users
+        response = await slack_client.get("https://slack.com/api/users.list")
+        data = response.json()
         
-        body = await request.json()
-        message = body.get("message")
-        user_id = body.get("user_id", "test_user")
+        if not data.get("ok"):
+            raise HTTPException(status_code=400, detail="Failed to fetch Slack users")
         
-        if not message:
-            raise HTTPException(status_code=400, detail="Message is required")
+        synced_users = []
+        for user in data.get("members", []):
+            if not user.get("deleted") and not user.get("is_bot"):
+                user_data = {
+                    "slack_user_id": user["id"],
+                    "full_name": user.get("real_name", user.get("name", "Unknown")),
+                    "role": "Employee",
+                    "department": "General",
+                    "location": "Remote",
+                    "tool_access": ["Slack"]
+                }
+                synced_users.append(user_data)
         
-        response = await ai_agent.process_message(user_id, message)
-        return {
-            "user_input": message,
-            "ai_response": response,
-            "user_id": user_id,
-            "timestamp": datetime.now().isoformat()
-        }
+        return {"synced_users": len(synced_users), "users": synced_users}
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/reset")
-async def reset_memory():
-    """Reset chat memory"""
-    global chat_memory, typing_tasks
-    chat_memory.clear()
-    typing_tasks.clear()
-    return {"status": "memory_reset", "timestamp": datetime.now().isoformat()}
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    logger.info(f"🚀 Starting EnableBot with Jira Integration on port {port}")
+    logger.info(f"🚀 Starting EnableBot SaaS on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
