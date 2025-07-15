@@ -1,4 +1,4 @@
-# main.py - Working EnableBot for Railway
+# main.py - Fixed EnableBot for Railway
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -311,42 +311,20 @@ async def health_check():
 async def handle_slack_events(request: Request):
     """Handle Slack events via HTTP webhooks"""
     try:
+        # Log that we received ANY request to this endpoint
+        logger.info("🎯 SLACK EVENT ENDPOINT HIT!")
+        
         # Get request body and headers
         body = await request.body()
         headers = request.headers
         
-        # Parse request first
-        try:
-            data = json.loads(body.decode())
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON: {e}")
-            raise HTTPException(status_code=400, detail="Invalid JSON")
-        
-        # Handle URL verification FIRST (before signature check)
-        if data.get("type") == "url_verification":
-            challenge = data.get("challenge")
-            logger.info(f"URL verification challenge: {challenge}")
-            return JSONResponse({"challenge": challenge})
-        
-        # Verify signature for other requests
-        if SLACK_SIGNING_SECRET:
-            timestamp = headers.get("x-slack-request-timestamp")
-            signature = headers.get("x-slack-signature")
-            
-            if not verify_slack_signature(body, timestamp, signature):
-                raise HTTPException(status_code=401, detail="Invalid signature")
-        
-@app.post("/slack/events")
-async def handle_slack_events(request: Request):
-    """Handle Slack events via HTTP webhooks"""
-    try:
-        # Get request body and headers
-        body = await request.body()
-        headers = request.headers
+        logger.info(f"📦 Request body length: {len(body)}")
+        logger.info(f"📋 Headers: {dict(headers)}")
         
         # Parse request first
         try:
             data = json.loads(body.decode())
+            logger.info(f"📄 Parsed JSON: {data}")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON: {e}")
             raise HTTPException(status_code=400, detail="Invalid JSON")
@@ -357,7 +335,7 @@ async def handle_slack_events(request: Request):
         # Handle URL verification FIRST (before signature check)
         if data.get("type") == "url_verification":
             challenge = data.get("challenge")
-            logger.info(f"URL verification challenge: {challenge}")
+            logger.info(f"✅ URL verification challenge: {challenge}")
             return JSONResponse({"challenge": challenge})
         
         # Verify signature for other requests
@@ -368,6 +346,8 @@ async def handle_slack_events(request: Request):
             if not verify_slack_signature(body, timestamp, signature):
                 logger.error("❌ Invalid Slack signature")
                 raise HTTPException(status_code=401, detail="Invalid signature")
+        else:
+            logger.warning("⚠️ No SLACK_SIGNING_SECRET - skipping signature verification")
         
         # Handle events
         if data.get("type") == "event_callback":
@@ -384,7 +364,7 @@ async def handle_slack_events(request: Request):
                 logger.info("⏭️ Skipping bot/system message")
                 return JSONResponse({"status": "ignored"})
             
-            # Handle both channel messages and DMs
+            # Handle DM messages
             if event_type == "message":
                 channel = event.get("channel")
                 user = event.get("user")
@@ -399,18 +379,6 @@ async def handle_slack_events(request: Request):
                 # Process message asynchronously
                 asyncio.create_task(process_slack_message(channel, user, text))
                 logger.info("🚀 Message queued for processing")
-            
-            # Handle app mentions
-            elif event_type == "app_mention":
-                channel = event.get("channel")
-                user = event.get("user")
-                text = event.get("text", "").strip()
-                
-                logger.info(f"📢 App mention: '{text[:50]}...' from {user} in {channel}")
-                
-                if all([channel, user, text]):
-                    asyncio.create_task(process_slack_message(channel, user, text))
-                    logger.info("🚀 Mention queued for processing")
         
         return JSONResponse({"status": "ok"})
         
