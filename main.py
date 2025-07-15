@@ -1,5 +1,5 @@
-# main.py - Complete EnableBot SaaS Backend
-from fastapi import FastAPI, HTTPException, Request, Depends
+# main.py - EnableBot with Optional Dependencies
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 import os
@@ -11,12 +11,25 @@ import hmac
 import hashlib
 import httpx
 import base64
-import asyncpg
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Any
 from pydantic import BaseModel
-import numpy as np
-from sentence_transformers import SentenceTransformer
+
+# Optional imports with fallbacks
+try:
+    import asyncpg
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
+    asyncpg = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    EMBEDDINGS_AVAILABLE = True
+except ImportError:
+    EMBEDDINGS_AVAILABLE = False
+    SentenceTransformer = None
 
 # Configure logging
 logging.basicConfig(
@@ -101,16 +114,21 @@ if JIRA_URL and JIRA_EMAIL and JIRA_API_TOKEN:
     except Exception as e:
         logger.error(f"❌ Failed to initialize Jira: {e}")
 
-# Initialize sentence transformer for embeddings
+# Initialize sentence transformer for embeddings (optional)
 embedding_model = None
-try:
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-    logger.info("✅ Sentence transformer initialized")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize embedding model: {e}")
+if EMBEDDINGS_AVAILABLE:
+    try:
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        logger.info("✅ Sentence transformer initialized")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize embedding model: {e}")
+else:
+    logger.warning("⚠️ Sentence transformers not available - vector search disabled")
 
-# In-memory storage for sessions
+# In-memory storage for sessions and fallback
 chat_sessions = {}
+user_profiles_cache = {}
+jira_tickets_cache = {}
 usage_stats = {
     "total_messages": 0,
     "total_tokens": 0,
@@ -150,25 +168,22 @@ class JiraTicketRequest(BaseModel):
     issue_type: str = "Task"
     priority: str = "Medium"
 
-class JiraConnectionRequest(BaseModel):
-    jira_url: str
-    email: str
-    api_token: str
-
 class DatabaseManager:
-    """Handle all database operations"""
+    """Handle all database operations with fallbacks"""
     
     @staticmethod
     async def init_postgres():
         """Initialize PostgreSQL connection pool"""
         global postgres_pool
-        if POSTGRES_URL and not postgres_pool:
+        if POSTGRES_URL and POSTGRES_AVAILABLE and not postgres_pool:
             try:
                 postgres_pool = await asyncpg.create_pool(POSTGRES_URL, min_size=1, max_size=5)
                 await DatabaseManager.create_tables()
                 logger.info("✅ PostgreSQL pool initialized")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize PostgreSQL: {e}")
+        elif not POSTGRES_AVAILABLE:
+            logger.warning("⚠️ PostgreSQL not available - using in-memory storage")
     
     @staticmethod
     async def create_tables():
@@ -176,36 +191,43 @@ class DatabaseManager:
         if not postgres_pool:
             return
         
-        async with postgres_pool.acquire() as conn:
-            # Chat memory table
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS chat_memory (
-                    id SERIAL PRIMARY KEY,
-                    session_id VARCHAR(255) NOT NULL,
-                    message_type VARCHAR(20) NOT NULL,
-                    content TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            
-            # Jira tickets memory
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS jira_tickets (
-                    id SERIAL PRIMARY KEY,
-                    user_id VARCHAR(255) NOT NULL,
-                    ticket_key VARCHAR(50) NOT NULL,
-                    summary TEXT NOT NULL,
-                    status VARCHAR(50),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            
-            logger.info("✅ Database tables created/verified")
+        try:
+            async with postgres_pool.acquire() as conn:
+                # Chat memory table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS chat_memory (
+                        id SERIAL PRIMARY KEY,
+                        session_id VARCHAR(255) NOT NULL,
+                        message_type VARCHAR(20) NOT NULL,
+                        content TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                
+                # Jira tickets memory
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS jira_tickets (
+                        id SERIAL PRIMARY KEY,
+                        user_id VARCHAR(255) NOT NULL,
+                        ticket_key VARCHAR(50) NOT NULL,
+                        summary TEXT NOT NULL,
+                        status VARCHAR(50),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                
+                logger.info("✅ Database tables created/verified")
+        except Exception as e:
+            logger.error(f"Error creating tables: {e}")
     
     @staticmethod
     async def get_user_profile(slack_user_id: str) -> Optional[UserProfile]:
-        """Get user profile from Supabase"""
+        """Get user profile from Supabase or cache"""
+        # Try cache first
+        if slack_user_id in user_profiles_cache:
+            return user_profiles_cache[slack_user_id]
+        
         if not supabase_client:
             return None
         
@@ -219,7 +241,7 @@ class DatabaseManager:
                 data = response.json()
                 if data:
                     user_data = data[0]
-                    return UserProfile(
+                    profile = UserProfile(
                         slack_user_id=user_data["slack_user_id"],
                         full_name=user_data["full_name"],
                         role=user_data["role"],
@@ -227,6 +249,9 @@ class DatabaseManager:
                         location=user_data["location"],
                         tool_access=user_data["tool_access"] or []
                     )
+                    # Cache the profile
+                    user_profiles_cache[slack_user_id] = profile
+                    return profile
         except Exception as e:
             logger.error(f"Error fetching user profile: {e}")
         
@@ -234,89 +259,108 @@ class DatabaseManager:
     
     @staticmethod
     async def get_chat_history(session_id: str, limit: int = 10) -> List[Dict]:
-        """Get chat history from PostgreSQL"""
-        if not postgres_pool:
-            return []
+        """Get chat history from PostgreSQL or memory"""
+        if postgres_pool:
+            try:
+                async with postgres_pool.acquire() as conn:
+                    rows = await conn.fetch("""
+                        SELECT message_type, content FROM chat_memory 
+                        WHERE session_id = $1 
+                        ORDER BY created_at DESC 
+                        LIMIT $2
+                    """, session_id, limit)
+                    
+                    history = []
+                    for row in reversed(rows):
+                        history.append({
+                            "role": "user" if row["message_type"] == "human" else "assistant",
+                            "content": row["content"]
+                        })
+                    
+                    return history
+            except Exception as e:
+                logger.error(f"Error fetching chat history: {e}")
         
-        try:
-            async with postgres_pool.acquire() as conn:
-                rows = await conn.fetch("""
-                    SELECT message_type, content FROM chat_memory 
-                    WHERE session_id = $1 
-                    ORDER BY created_at DESC 
-                    LIMIT $2
-                """, session_id, limit)
-                
-                history = []
-                for row in reversed(rows):
-                    history.append({
-                        "role": "user" if row["message_type"] == "human" else "assistant",
-                        "content": row["content"]
-                    })
-                
-                return history
-        except Exception as e:
-            logger.error(f"Error fetching chat history: {e}")
-            return []
+        # Fallback to in-memory storage
+        return chat_sessions.get(session_id, [])
     
     @staticmethod
     async def save_chat_message(session_id: str, message_type: str, content: str):
-        """Save chat message to PostgreSQL"""
-        if not postgres_pool:
-            return
+        """Save chat message to PostgreSQL or memory"""
+        if postgres_pool:
+            try:
+                async with postgres_pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO chat_memory (session_id, message_type, content)
+                        VALUES ($1, $2, $3)
+                    """, session_id, message_type, content)
+                    return
+            except Exception as e:
+                logger.error(f"Error saving chat message: {e}")
         
-        try:
-            async with postgres_pool.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO chat_memory (session_id, message_type, content)
-                    VALUES ($1, $2, $3)
-                """, session_id, message_type, content)
-        except Exception as e:
-            logger.error(f"Error saving chat message: {e}")
+        # Fallback to in-memory storage
+        if session_id not in chat_sessions:
+            chat_sessions[session_id] = []
+        
+        chat_sessions[session_id].append({
+            "role": "user" if message_type == "human" else "assistant",
+            "content": content,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Keep only last 20 messages in memory
+        if len(chat_sessions[session_id]) > 20:
+            chat_sessions[session_id] = chat_sessions[session_id][-20:]
     
     @staticmethod
     async def save_jira_ticket(user_id: str, ticket_key: str, summary: str, status: str = "Open"):
         """Save Jira ticket to memory"""
-        if not postgres_pool:
-            return
+        if postgres_pool:
+            try:
+                async with postgres_pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO jira_tickets (user_id, ticket_key, summary, status)
+                        VALUES ($1, $2, $3, $4)
+                        ON CONFLICT (ticket_key) DO UPDATE SET
+                        status = EXCLUDED.status,
+                        updated_at = CURRENT_TIMESTAMP
+                    """, user_id, ticket_key, summary, status)
+                    return
+            except Exception as e:
+                logger.error(f"Error saving Jira ticket: {e}")
         
-        try:
-            async with postgres_pool.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO jira_tickets (user_id, ticket_key, summary, status)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (ticket_key) DO UPDATE SET
-                    status = EXCLUDED.status,
-                    updated_at = CURRENT_TIMESTAMP
-                """, user_id, ticket_key, summary, status)
-        except Exception as e:
-            logger.error(f"Error saving Jira ticket: {e}")
+        # Fallback to in-memory storage
+        jira_tickets_cache[user_id] = {
+            "ticket_key": ticket_key,
+            "summary": summary,
+            "status": status,
+            "created_at": datetime.now().isoformat()
+        }
     
     @staticmethod
     async def get_last_jira_ticket(user_id: str) -> Optional[Dict]:
         """Get user's last Jira ticket"""
-        if not postgres_pool:
-            return None
+        if postgres_pool:
+            try:
+                async with postgres_pool.acquire() as conn:
+                    row = await conn.fetchrow("""
+                        SELECT ticket_key, summary, status FROM jira_tickets 
+                        WHERE user_id = $1 
+                        ORDER BY created_at DESC 
+                        LIMIT 1
+                    """, user_id)
+                    
+                    if row:
+                        return {
+                            "ticket_key": row["ticket_key"],
+                            "summary": row["summary"],
+                            "status": row["status"]
+                        }
+            except Exception as e:
+                logger.error(f"Error fetching last Jira ticket: {e}")
         
-        try:
-            async with postgres_pool.acquire() as conn:
-                row = await conn.fetchrow("""
-                    SELECT ticket_key, summary, status FROM jira_tickets 
-                    WHERE user_id = $1 
-                    ORDER BY created_at DESC 
-                    LIMIT 1
-                """, user_id)
-                
-                if row:
-                    return {
-                        "ticket_key": row["ticket_key"],
-                        "summary": row["summary"],
-                        "status": row["status"]
-                    }
-        except Exception as e:
-            logger.error(f"Error fetching last Jira ticket: {e}")
-        
-        return None
+        # Fallback to in-memory storage
+        return jira_tickets_cache.get(user_id)
 
 class VectorSearch:
     """Handle vector search operations"""
@@ -324,7 +368,31 @@ class VectorSearch:
     @staticmethod
     async def search_knowledge_base(query: str, limit: int = 3) -> List[Dict]:
         """Search knowledge base using vector similarity"""
-        if not supabase_client or not embedding_model:
+        if not supabase_client:
+            logger.warning("Supabase not available for vector search")
+            return []
+        
+        if not EMBEDDINGS_AVAILABLE:
+            logger.warning("Embeddings not available - using text search fallback")
+            # Simple text search fallback
+            try:
+                response = await supabase_client.get(
+                    f"{SUPABASE_URL}/rest/v1/documents",
+                    params={"content": f"ilike.%{query}%", "limit": limit}
+                )
+                
+                if response.status_code == 200:
+                    results = response.json()
+                    return [
+                        {
+                            "content": doc["content"],
+                            "metadata": doc.get("metadata", {}),
+                            "similarity": 0.8  # Mock similarity
+                        }
+                        for doc in results
+                    ]
+            except Exception as e:
+                logger.error(f"Error in text search: {e}")
             return []
         
         try:
@@ -446,33 +514,24 @@ class EnableBotAI:
 
 You help employees with topics such as HR, IT, onboarding, tool access, compliance, internal policies, and Jira support.
 
-You have access to an internal knowledge base via vector search. When users ask questions, always:
-1. Search the knowledge base using the vector database.
-2. If relevant context is found, include the most accurate, useful, and concise answer based on that information.
-3. If no relevant information is found, say so honestly and offer to help further.
-4. Check if the current question is related to any of the previous questions or answers, and respond accordingly.
-5. If the answer is not in the knowledge base, use your own LLM understanding to assist.
+You have access to an internal knowledge base. When users ask questions:
+1. If relevant context is found, include the most accurate, useful, and concise answer based on that information.
+2. If no relevant information is found, say so honestly and offer to help further.
+3. If the answer is not in the knowledge base, use your own understanding to assist.
 
 You can also create Jira tickets for users. When a user reports an issue or requests support, create a Jira ticket and return:
 - A short confirmation message.
 - The Jira ticket ID (e.g. KAN-123).
 - A summary of what the ticket is about.
 
-Store the last created Jira ticket ID in memory, so if the user asks something like:
-- "Any update on my ticket?"
-- "What's the status of my last Jira request?"
-You can respond with the correct ID and redirect them to the Jira link if necessary.
 When responding with Jira ticket links, always use the format:
-https://surya-ai.atlassian.net/browse/{ticket_id} instead of API URLs.
-
-When listing ticket statuses, use the latest live data from the Jira status.name field. Do not rely on old or hardcoded transitions or assumptions.
+https://surya-ai.atlassian.net/browse/{ticket_id}
 
 Always respond in clear and plain text without any special formatting, markdown, emojis, or symbols.
 
 Rules:
 - Only greet with "Hi {user_name}" if this is the first message in the session.
-- Keep answers professional, short, and easy to understand.
-- Do not include phrases like "Automated with n8n" in the response."""
+- Keep answers professional, short, and easy to understand."""
 
     async def process_message(self, user_profile: UserProfile, message: str, session_id: str) -> str:
         """Process user message with context and tools"""
@@ -631,158 +690,130 @@ async def get_slack_user_info(user_id: str) -> Dict[str, Any]:
     
     return {}
 
-# Dashboard HTML (from previous version)
+# Simple Dashboard HTML
 DASHBOARD_HTML = """
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EnableBot SaaS Dashboard</title>
+    <title>EnableBot Dashboard</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #F8FAFC; color: #1E293B; }
-        .dashboard { max-width: 1200px; margin: 0 auto; padding: 2rem; }
-        .header { background: white; padding: 2rem; border-radius: 1rem; margin-bottom: 2rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .title { font-size: 2rem; font-weight: 700; color: #1E293B; margin-bottom: 0.5rem; }
-        .subtitle { color: #64748B; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; }
-        .card { background: white; padding: 1.5rem; border-radius: 0.75rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .card h3 { font-size: 1.125rem; font-weight: 600; margin-bottom: 1rem; }
-        .metric { display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 0; border-bottom: 1px solid #F1F5F9; }
-        .metric:last-child { border-bottom: none; }
-        .metric-value { font-weight: 600; color: #059669; }
-        .status-connected { color: #059669; }
-        .status-disconnected { color: #DC2626; }
-        .btn { padding: 0.75rem 1.5rem; border: none; border-radius: 0.5rem; font-weight: 500; cursor: pointer; transition: all 0.2s; }
-        .btn-primary { background: #3B82F6; color: white; }
-        .btn-primary:hover { background: #2563EB; }
+        body { font-family: Arial, sans-serif; margin: 2rem; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header { background: white; padding: 2rem; border-radius: 8px; margin-bottom: 2rem; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; }
+        .card { background: white; padding: 1.5rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .status-ok { color: #22c55e; font-weight: bold; }
+        .status-error { color: #ef4444; font-weight: bold; }
+        .metric { display: flex; justify-content: space-between; margin: 0.5rem 0; }
     </style>
 </head>
 <body>
-    <div class="dashboard">
+    <div class="container">
         <div class="header">
-            <h1 class="title">🤖 EnableBot SaaS Dashboard</h1>
-            <p class="subtitle">Complete AI assistant with Slack, Jira, Vector Search & User Management</p>
+            <h1>🤖 EnableBot Dashboard</h1>
+            <p>AI Assistant with Slack, Jira & Knowledge Base Integration</p>
         </div>
         
         <div class="grid">
             <div class="card">
-                <h3>🔧 System Status</h3>
+                <h3>System Status</h3>
                 <div class="metric">
-                    <span>OpenAI</span>
-                    <span id="openaiStatus" class="status-disconnected">Loading...</span>
+                    <span>OpenAI:</span>
+                    <span id="openai-status" class="status-error">Loading...</span>
                 </div>
                 <div class="metric">
-                    <span>Slack</span>
-                    <span id="slackStatus" class="status-disconnected">Loading...</span>
+                    <span>Slack:</span>
+                    <span id="slack-status" class="status-error">Loading...</span>
                 </div>
                 <div class="metric">
-                    <span>Supabase</span>
-                    <span id="supabaseStatus" class="status-disconnected">Loading...</span>
+                    <span>Jira:</span>
+                    <span id="jira-status" class="status-error">Loading...</span>
                 </div>
                 <div class="metric">
-                    <span>PostgreSQL</span>
-                    <span id="postgresStatus" class="status-disconnected">Loading...</span>
+                    <span>PostgreSQL:</span>
+                    <span id="postgres-status" class="status-error">Loading...</span>
                 </div>
                 <div class="metric">
-                    <span>Jira</span>
-                    <span id="jiraStatus" class="status-disconnected">Loading...</span>
-                </div>
-            </div>
-            
-            <div class="card">
-                <h3>📊 Usage Stats</h3>
-                <div class="metric">
-                    <span>Total Messages</span>
-                    <span id="totalMessages" class="metric-value">0</span>
-                </div>
-                <div class="metric">
-                    <span>Total Tokens</span>
-                    <span id="totalTokens" class="metric-value">0</span>
-                </div>
-                <div class="metric">
-                    <span>Total Cost</span>
-                    <span id="totalCost" class="metric-value">$0.00</span>
+                    <span>Supabase:</span>
+                    <span id="supabase-status" class="status-error">Loading...</span>
                 </div>
             </div>
             
             <div class="card">
-                <h3>🎫 Jira Integration</h3>
+                <h3>Usage Statistics</h3>
                 <div class="metric">
-                    <span>Status</span>
-                    <span id="jiraIntegrationStatus" class="status-disconnected">Not Connected</span>
+                    <span>Total Messages:</span>
+                    <span id="total-messages">0</span>
                 </div>
-                <button class="btn btn-primary" onclick="testJiraConnection()">Test Connection</button>
+                <div class="metric">
+                    <span>Total Tokens:</span>
+                    <span id="total-tokens">0</span>
+                </div>
+                <div class="metric">
+                    <span>Total Cost:</span>
+                    <span id="total-cost">$0.00</span>
+                </div>
             </div>
             
             <div class="card">
-                <h3>🔍 Vector Search</h3>
+                <h3>Features Available</h3>
                 <div class="metric">
-                    <span>Embedding Model</span>
-                    <span id="embeddingStatus" class="status-disconnected">Loading...</span>
+                    <span>Vector Search:</span>
+                    <span id="vector-status" class="status-error">Loading...</span>
                 </div>
                 <div class="metric">
-                    <span>Knowledge Base</span>
-                    <span id="knowledgeBaseStatus" class="status-disconnected">Loading...</span>
+                    <span>Chat Memory:</span>
+                    <span id="memory-status" class="status-ok">Available</span>
+                </div>
+                <div class="metric">
+                    <span>User Profiles:</span>
+                    <span id="profiles-status" class="status-error">Loading...</span>
                 </div>
             </div>
         </div>
     </div>
     
     <script>
-        async function refreshStats() {
+        async function updateStatus() {
             try {
                 const response = await fetch('/health');
                 const data = await response.json();
                 
-                document.getElementById('openaiStatus').textContent = data.services.openai ? 'Connected' : 'Disconnected';
-                document.getElementById('openaiStatus').className = data.services.openai ? 'status-connected' : 'status-disconnected';
+                // Update service status
+                document.getElementById('openai-status').textContent = data.services.openai ? 'Connected' : 'Disconnected';
+                document.getElementById('openai-status').className = data.services.openai ? 'status-ok' : 'status-error';
                 
-                document.getElementById('slackStatus').textContent = data.services.slack ? 'Connected' : 'Disconnected';
-                document.getElementById('slackStatus').className = data.services.slack ? 'status-connected' : 'status-disconnected';
+                document.getElementById('slack-status').textContent = data.services.slack ? 'Connected' : 'Disconnected';
+                document.getElementById('slack-status').className = data.services.slack ? 'status-ok' : 'status-error';
                 
-                document.getElementById('supabaseStatus').textContent = data.services.supabase ? 'Connected' : 'Disconnected';
-                document.getElementById('supabaseStatus').className = data.services.supabase ? 'status-connected' : 'status-disconnected';
+                document.getElementById('jira-status').textContent = data.services.jira ? 'Connected' : 'Disconnected';
+                document.getElementById('jira-status').className = data.services.jira ? 'status-ok' : 'status-error';
                 
-                document.getElementById('postgresStatus').textContent = data.services.postgres ? 'Connected' : 'Disconnected';
-                document.getElementById('postgresStatus').className = data.services.postgres ? 'status-connected' : 'status-disconnected';
+                document.getElementById('postgres-status').textContent = data.services.postgres ? 'Connected' : 'In-Memory';
+                document.getElementById('postgres-status').className = data.services.postgres ? 'status-ok' : 'status-error';
                 
-                document.getElementById('jiraStatus').textContent = data.services.jira ? 'Connected' : 'Disconnected';
-                document.getElementById('jiraStatus').className = data.services.jira ? 'status-connected' : 'status-disconnected';
+                document.getElementById('supabase-status').textContent = data.services.supabase ? 'Connected' : 'Disconnected';
+                document.getElementById('supabase-status').className = data.services.supabase ? 'status-ok' : 'status-error';
                 
-                document.getElementById('embeddingStatus').textContent = data.services.embedding ? 'Connected' : 'Disconnected';
-                document.getElementById('embeddingStatus').className = data.services.embedding ? 'status-connected' : 'status-disconnected';
+                document.getElementById('vector-status').textContent = data.services.embedding ? 'Available' : 'Text Search Only';
+                document.getElementById('vector-status').className = data.services.embedding ? 'status-ok' : 'status-error';
                 
-                document.getElementById('knowledgeBaseStatus').textContent = data.services.supabase ? 'Connected' : 'Disconnected';
-                document.getElementById('knowledgeBaseStatus').className = data.services.supabase ? 'status-connected' : 'status-disconnected';
-                
-                document.getElementById('jiraIntegrationStatus').textContent = data.services.jira ? 'Connected' : 'Not Connected';
-                document.getElementById('jiraIntegrationStatus').className = data.services.jira ? 'status-connected' : 'status-disconnected';
+                document.getElementById('profiles-status').textContent = data.services.supabase ? 'Available' : 'Cache Only';
+                document.getElementById('profiles-status').className = data.services.supabase ? 'status-ok' : 'status-error';
                 
                 // Update usage stats
-                document.getElementById('totalMessages').textContent = data.usage.total_messages.toLocaleString();
-                document.getElementById('totalTokens').textContent = data.usage.total_tokens.toLocaleString();
-                document.getElementById('totalCost').textContent = `${data.usage.total_cost.toFixed(2)}`;
+                document.getElementById('total-messages').textContent = data.usage.total_messages;
+                document.getElementById('total-tokens').textContent = data.usage.total_tokens;
+                document.getElementById('total-cost').textContent = ' + data.usage.total_cost.toFixed(2);
                 
             } catch (error) {
-                console.error('Failed to refresh stats:', error);
+                console.error('Error updating status:', error);
             }
         }
         
-        async function testJiraConnection() {
-            try {
-                const response = await fetch('/jira/test-connection');
-                const result = await response.json();
-                alert(result.success ? 'Jira connection successful!' : `Connection failed: ${result.error}`);
-            } catch (error) {
-                alert(`Connection test failed: ${error.message}`);
-            }
-        }
-        
-        // Auto refresh every 30 seconds
-        setInterval(refreshStats, 30000);
-        refreshStats();
+        // Update every 30 seconds
+        setInterval(updateStatus, 30000);
+        updateStatus();
     </script>
 </body>
 </html>
@@ -793,7 +824,10 @@ DASHBOARD_HTML = """
 @app.on_event("startup")
 async def startup_event():
     """Initialize database connections on startup"""
-    await DatabaseManager.init_postgres()
+    if POSTGRES_AVAILABLE:
+        await DatabaseManager.init_postgres()
+    else:
+        logger.info("🟡 Starting with in-memory storage only")
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
@@ -817,6 +851,10 @@ async def health_check():
         "usage": usage_stats,
         "memory": {
             "active_sessions": len(chat_sessions)
+        },
+        "capabilities": {
+            "postgres_available": POSTGRES_AVAILABLE,
+            "embeddings_available": EMBEDDINGS_AVAILABLE
         }
     }
 
@@ -852,7 +890,23 @@ async def handle_slack_webhook(request: Request):
         # Extract data (Code1)
         slack_user_id = event.get("user")
         channel = event.get("channel")
-        text = event.get("text", "")
+        
+        # Handle different text extraction methods
+        text = ""
+        if event.get("text"):
+            text = event.get("text", "")
+        elif event.get("blocks"):
+            # Extract text from blocks structure (from n8n workflow)
+            try:
+                blocks = event.get("blocks", [])
+                if blocks and len(blocks) > 0:
+                    elements = blocks[0].get("elements", [])
+                    if elements and len(elements) > 0:
+                        sub_elements = elements[0].get("elements", [])
+                        if sub_elements and len(sub_elements) > 0:
+                            text = sub_elements[0].get("text", "")
+            except (IndexError, KeyError):
+                text = ""
         
         if not all([slack_user_id, channel, text]):
             return JSONResponse({"status": "ignored"})
@@ -871,7 +925,7 @@ async def handle_slack_webhook(request: Request):
                 role="Employee",
                 department="General",
                 location="Remote",
-                tool_access=[]
+                tool_access=["Slack"]
             )
         
         # Generate session ID (Code)
@@ -946,14 +1000,6 @@ async def vector_search_api(query: str, limit: int = 5):
     results = await VectorSearch.search_knowledge_base(query, limit)
     return {"results": results}
 
-@app.get("/user-profile/{slack_user_id}")
-async def get_user_profile_api(slack_user_id: str):
-    """Get user profile via API"""
-    profile = await DatabaseManager.get_user_profile(slack_user_id)
-    if not profile:
-        raise HTTPException(status_code=404, detail="User not found")
-    return profile
-
 @app.post("/chat/test")
 async def test_chat_api(message: str, user_id: str = "test_user"):
     """Test chat functionality"""
@@ -997,11 +1043,29 @@ async def reset_chat_session(session_id: str):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     else:
-        raise HTTPException(status_code=503, detail="Database not available")
+        # Reset in-memory storage
+        if session_id in chat_sessions:
+            del chat_sessions[session_id]
+        return {"status": "reset", "session_id": session_id}
 
 @app.get("/stats/usage")
 async def get_usage_stats():
     """Get detailed usage statistics"""
+    stats = {
+        "usage_stats": usage_stats,
+        "total_tickets": len(jira_tickets_cache),
+        "capabilities": {
+            "postgres_available": POSTGRES_AVAILABLE,
+            "embeddings_available": EMBEDDINGS_AVAILABLE,
+            "services_connected": {
+                "openai": bool(openai_client),
+                "slack": bool(slack_client),
+                "jira": bool(jira_client),
+                "supabase": bool(supabase_client)
+            }
+        }
+    }
+    
     if postgres_pool:
         try:
             async with postgres_pool.acquire() as conn:
@@ -1018,50 +1082,17 @@ async def get_usage_stats():
                 # Get total tickets created
                 ticket_count = await conn.fetchval("SELECT COUNT(*) FROM jira_tickets")
                 
-                return {
-                    "usage_stats": usage_stats,
-                    "daily_stats": [dict(row) for row in daily_stats],
-                    "total_tickets": ticket_count or 0
-                }
+                stats["daily_stats"] = [dict(row) for row in daily_stats]
+                stats["total_tickets"] = ticket_count or 0
         except Exception as e:
-            return {"error": str(e)}
+            logger.error(f"Error fetching database stats: {e}")
     
-    return {"usage_stats": usage_stats}
-
-@app.post("/admin/sync-users")
-async def sync_users_from_slack():
-    """Sync users from Slack to Supabase (admin endpoint)"""
-    if not slack_client or not supabase_client:
-        raise HTTPException(status_code=503, detail="Required services not available")
-    
-    try:
-        # Get Slack users
-        response = await slack_client.get("https://slack.com/api/users.list")
-        data = response.json()
-        
-        if not data.get("ok"):
-            raise HTTPException(status_code=400, detail="Failed to fetch Slack users")
-        
-        synced_users = []
-        for user in data.get("members", []):
-            if not user.get("deleted") and not user.get("is_bot"):
-                user_data = {
-                    "slack_user_id": user["id"],
-                    "full_name": user.get("real_name", user.get("name", "Unknown")),
-                    "role": "Employee",
-                    "department": "General",
-                    "location": "Remote",
-                    "tool_access": ["Slack"]
-                }
-                synced_users.append(user_data)
-        
-        return {"synced_users": len(synced_users), "users": synced_users}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return stats
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    logger.info(f"🚀 Starting EnableBot SaaS on port {port}")
+    logger.info(f"🚀 Starting EnableBot SaaS (Minimal) on port {port}")
+    logger.info(f"📦 PostgreSQL: {'Available' if POSTGRES_AVAILABLE else 'Not Available (using in-memory)'}")
+    logger.info(f"🔍 Embeddings: {'Available' if EMBEDDINGS_AVAILABLE else 'Not Available (using text search)'}")
     uvicorn.run(app, host="0.0.0.0", port=port)
