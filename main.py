@@ -10,6 +10,7 @@ import json
 import hmac
 import hashlib
 import httpx
+import base64
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Any
 from pydantic import BaseModel
@@ -64,7 +65,6 @@ jira_client = None
 jira_projects = []
 if JIRA_URL and JIRA_EMAIL and JIRA_API_TOKEN:
     try:
-        import base64
         auth_string = f"{JIRA_EMAIL}:{JIRA_API_TOKEN}"
         encoded_auth = base64.b64encode(auth_string.encode()).decode()
         
@@ -1400,7 +1400,6 @@ async def connect_jira_endpoint(connection_data: JiraConnectionRequest):
             JIRA_API_TOKEN = connection_data.api_token
             
             # Reinitialize Jira client
-            import base64
             auth_string = f"{JIRA_EMAIL}:{JIRA_API_TOKEN}"
             encoded_auth = base64.b64encode(auth_string.encode()).decode()
             
