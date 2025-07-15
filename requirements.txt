@@ -1,6 +1,9 @@
 fastapi
-uvicorn
+uvicorn[standard]
 openai
 httpx
 psutil
 python-multipart
+supabase
+secrets
+urllib.parse
