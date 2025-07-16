@@ -1005,6 +1005,32 @@ async def start_slack_installation():
     # Generate state parameter for security
     state = secrets.token_urlsafe(32)
     
+    # Updated scopes to match your Slack app configuration
+    scopes = [
+        "chat:write",
+        "im:read",      # Changed from im:history
+        "im:write", 
+        "users:read",
+        "teams:read"
+    ]
+    
+    oauth_params = {
+        "client_id": SLACK_CLIENT_ID,
+        "scope": ",".join(scopes),
+        "redirect_uri": SLACK_REDIRECT_URI,
+        "state": state
+    }
+    
+    oauth_url = f"https://slack.com/oauth/v2/authorize?{urlencode(oauth_params)}"
+    
+    return RedirectResponse(url=oauth_url, status_code=302)
+    """Start Slack OAuth installation flow"""
+    if not SLACK_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Slack client ID not configured")
+    
+    # Generate state parameter for security
+    state = secrets.token_urlsafe(32)
+    
     # Slack OAuth URL with required scopes (DM-only scopes)
     scopes = [
         "chat:write",
