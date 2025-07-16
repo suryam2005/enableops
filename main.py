@@ -1,7 +1,7 @@
 # main.py - Complete EnableBot AI Service with Slack Installation Flow
 from fastapi import FastAPI, HTTPException, Request, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import os
 import asyncio
@@ -28,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
-app = FastAPI(title="EnableBot AI AGENT Service", version="2.1.0")
+app = FastAPI(title="EnableBot AI Service", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1023,11 +1023,9 @@ async def start_slack_installation():
     
     oauth_url = f"https://slack.com/oauth/v2/authorize?{urlencode(oauth_params)}"
     
-    return {
-        "installation_url": oauth_url,
-        "state": state,
-        "message": "Click the URL to install EnableBot to your Slack workspace"
-    }
+    # Redirect directly to Slack instead of returning JSON
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=oauth_url, status_code=302)
 
 @app.get("/slack/oauth")
 async def handle_slack_oauth(code: str, state: str = None):
