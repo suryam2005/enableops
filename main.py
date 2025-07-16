@@ -1,4 +1,4 @@
-# main.py - Production-Ready EnableBot AI Service with Document Upload
+# main.py - Complete EnableBot AI Service with Slack Installation Flow
 from fastapi import FastAPI, HTTPException, Request, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -17,6 +17,8 @@ import docx
 from datetime import datetime
 from typing import Dict, Optional, List, Any
 from pydantic import BaseModel
+from urllib.parse import urlencode
+import secrets
 
 # Configure logging
 logging.basicConfig(
@@ -42,6 +44,9 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
+SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET")
+SLACK_REDIRECT_URI = os.getenv("SLACK_REDIRECT_URI")
 
 # Initialize OpenAI client
 openai_client = None
@@ -118,6 +123,23 @@ class SlackEventWrapper(BaseModel):
     event_id: Optional[str] = None
     event_time: Optional[int] = None
     challenge: Optional[str] = None
+
+class SlackInstallation(BaseModel):
+    team_id: str
+    team_name: str
+    bot_token: str
+    bot_user_id: str
+    installer_id: str
+    installer_name: str
+    scopes: List[str]
+
+class CompanySetup(BaseModel):
+    company_name: str
+    admin_name: str
+    admin_email: Optional[str] = None
+    admin_role: str = "Admin"
+    department: str = "Management"
+    location: str = "Office"
 
 # Document processing utilities
 async def extract_text_from_file(file: UploadFile) -> str:
@@ -268,7 +290,7 @@ async def search_knowledge_base(tenant_id: str, query: str, limit: int = 3) -> L
         ]
     
     try:
-        # First try vector search with corrected table name
+        # First try vector search
         query_embedding = await get_embedding(query)
         if query_embedding:
             response = await supabase_client.post(
@@ -430,6 +452,218 @@ async def get_chat_history(tenant_id: str, session_id: str, limit: int = 10) -> 
         logger.error(f"Error fetching chat history: {e}")
     
     return []
+
+# Database functions for auto-setup
+async def create_tenant_from_slack(installation: SlackInstallation) -> bool:
+    """Automatically create tenant from Slack installation"""
+    if not supabase_client:
+        logger.warning("Supabase not available - tenant creation skipped")
+        return False
+    
+    try:
+        # Check if tenant already exists
+        existing = await supabase_client.get(
+            f"{SUPABASE_URL}/rest/v1/tenants",
+            params={"team_id": f"eq.{installation.team_id}"}
+        )
+        
+        if existing.status_code == 200 and existing.json():
+            logger.info(f"Tenant {installation.team_id} already exists - updating")
+            # Update existing tenant
+            await supabase_client.patch(
+                f"{SUPABASE_URL}/rest/v1/tenants",
+                params={"team_id": f"eq.{installation.team_id}"},
+                json={
+                    "team_name": installation.team_name,
+                    "access_token": installation.bot_token,
+                    "bot_user_id": installation.bot_user_id,
+                    "last_active": datetime.now().isoformat(),
+                    "active": True
+                }
+            )
+        else:
+            # Create new tenant
+            await supabase_client.post(
+                f"{SUPABASE_URL}/rest/v1/tenants",
+                json={
+                    "team_id": installation.team_id,
+                    "team_name": installation.team_name,
+                    "access_token": installation.bot_token,
+                    "bot_user_id": installation.bot_user_id,
+                    "installed_by": installation.installer_id,
+                    "installer_name": installation.installer_name,
+                    "plan": "free",
+                    "settings": {
+                        "features": ["ai_chat", "document_search"],
+                        "max_users": 50,
+                        "installation_date": datetime.now().isoformat(),
+                        "scopes": installation.scopes
+                    }
+                }
+            )
+        
+        # Log installation event
+        await supabase_client.post(
+            f"{SUPABASE_URL}/rest/v1/installation_events",
+            json={
+                "team_id": installation.team_id,
+                "team_name": installation.team_name,
+                "event_type": "app_installed",
+                "installed_by": installation.installer_id,
+                "installer_name": installation.installer_name,
+                "metadata": {
+                    "bot_user_id": installation.bot_user_id,
+                    "scopes": installation.scopes,
+                    "installation_timestamp": datetime.now().isoformat()
+                }
+            }
+        )
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error creating tenant: {e}")
+        return False
+
+async def create_admin_user(installation: SlackInstallation) -> bool:
+    """Create admin user profile from installation"""
+    if not supabase_client:
+        return False
+    
+    try:
+        # Check if user already exists
+        existing = await supabase_client.get(
+            f"{SUPABASE_URL}/rest/v1/user_profiles",
+            params={
+                "tenant_id": f"eq.{installation.team_id}",
+                "slack_user_id": f"eq.{installation.installer_id}"
+            }
+        )
+        
+        if existing.status_code == 200 and existing.json():
+            logger.info(f"Admin user {installation.installer_id} already exists")
+            return True
+        
+        # Create admin user profile
+        await supabase_client.post(
+            f"{SUPABASE_URL}/rest/v1/user_profiles",
+            json={
+                "tenant_id": installation.team_id,
+                "slack_user_id": installation.installer_id,
+                "full_name": installation.installer_name,
+                "role": "Admin",
+                "department": "Management",
+                "location": "Office",
+                "tool_access": ["Slack", "EnableBot Admin", "All Features"],
+                "active": True
+            }
+        )
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error creating admin user: {e}")
+        return False
+
+async def create_sample_documents(tenant_id: str, company_name: str) -> bool:
+    """Create sample documents for new tenant"""
+    if not supabase_client:
+        return False
+    
+    sample_docs = [
+        {
+            "title": f"{company_name} Welcome Guide",
+            "content": f"""Welcome to {company_name}!
+
+This is your getting started guide. Here you'll find:
+
+COMPANY OVERVIEW:
+{company_name} is committed to innovation and excellence. We believe in empowering our team members with the tools and knowledge they need to succeed.
+
+COMMUNICATION:
+- Primary communication happens in Slack
+- Use @EnableBot for AI assistance with company questions
+- Weekly team meetings are scheduled for project updates
+
+GETTING HELP:
+- Ask @EnableBot about company policies, procedures, and general questions
+- Contact your manager for role-specific guidance
+- IT support is available for technical issues
+
+RESOURCES:
+- Company handbook (coming soon)
+- IT setup guide (coming soon)
+- Benefits information (coming soon)
+
+Welcome to the team!""",
+            "document_type": "welcome_guide",
+            "metadata": {
+                "auto_generated": True,
+                "template": "default_welcome",
+                "created_for": company_name
+            }
+        },
+        {
+            "title": "How to Use EnableBot",
+            "content": """ENABLEBOT USAGE GUIDE
+
+EnableBot is your AI assistant for workplace questions. Here's how to use it:
+
+BASIC USAGE:
+- Direct message EnableBot for private questions
+- Ask about company policies, procedures, IT help, and more
+
+EXAMPLE QUESTIONS:
+- "What's our vacation policy?"
+- "How do I access the company VPN?"
+- "Who should I contact for IT support?"
+- "What are our meeting room booking procedures?"
+
+FEATURES:
+- Instant answers based on company knowledge
+- Context-aware responses
+- Conversation memory
+- Document search capabilities
+
+TIPS:
+- Be specific in your questions for better answers
+- EnableBot learns from your company's uploaded documents
+- Admins can upload new documents to expand the knowledge base
+
+Need help? Just ask EnableBot: "How can you help me?" """,
+            "document_type": "user_guide",
+            "metadata": {
+                "auto_generated": True,
+                "template": "enablebot_guide",
+                "priority": "high"
+            }
+        }
+    ]
+    
+    try:
+        for doc in sample_docs:
+            # Generate embedding
+            embedding = await get_embedding(doc["content"])
+            
+            await supabase_client.post(
+                f"{SUPABASE_URL}/rest/v1/documents",
+                json={
+                    "tenant_id": tenant_id,
+                    "title": doc["title"],
+                    "content": doc["content"],
+                    "embedding": embedding,
+                    "document_type": doc["document_type"],
+                    "metadata": doc["metadata"],
+                    "active": True
+                }
+            )
+        
+        logger.info(f"Created {len(sample_docs)} sample documents for {tenant_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error creating sample documents: {e}")
+        return False
 
 class TenantAwareAI:
     """AI agent with tenant-specific context"""
@@ -663,9 +897,68 @@ def verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
 
 # API Routes
 
-@app.get("/")
-async def root():
-    """Root endpoint"""
+@app.get("/", response_class=HTMLResponse)
+async def root_with_install():
+    """Root page with Slack installation option"""
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>EnableBot - AI Assistant for Slack</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+                   max-width: 800px; margin: 0 auto; padding: 20px; background: #f8fafc; }}
+            .container {{ background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
+            .hero {{ text-align: center; margin-bottom: 40px; }}
+            .install-btn {{ display: inline-block; background: #4a154b; color: white; padding: 15px 30px; 
+                           border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 18px; }}
+            .features {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin: 30px 0; }}
+            .feature {{ background: #f1f5f9; padding: 20px; border-radius: 8px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="hero">
+                <h1>🤖 EnableBot</h1>
+                <p>AI-powered assistant for your Slack workspace</p>
+                <a href="/slack/install" class="install-btn">
+                    <img src="https://platform.slack-edge.com/img/add_to_slack.png" alt="Add to Slack" width="139" height="40">
+                </a>
+            </div>
+            
+            <div class="features">
+                <div class="feature">
+                    <h3>🧠 Smart Answers</h3>
+                    <p>Get instant answers about company policies, procedures, and more</p>
+                </div>
+                <div class="feature">
+                    <h3>📚 Knowledge Base</h3>
+                    <p>Upload documents and let AI search through your company knowledge</p>
+                </div>
+                <div class="feature">
+                    <h3>💬 Natural Chat</h3>
+                    <p>Conversation memory and context-aware responses</p>
+                </div>
+                <div class="feature">
+                    <h3>🏢 Multi-Tenant</h3>
+                    <p>Each workspace gets isolated, personalized AI assistance</p>
+                </div>
+            </div>
+            
+            <div style="text-align: center; margin-top: 30px;">
+                <p><strong>Service Status:</strong></p>
+                <p>🟢 AI Service: Running<br>
+                   🟢 Database: Connected<br>
+                   🟢 Document Processing: Ready</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.get("/api")
+async def api_status():
+    """API status endpoint"""
     return {
         "service": "EnableBot AI Service",
         "version": "2.1.0",
@@ -703,6 +996,166 @@ async def health_check():
         }
     }
 
+@app.get("/slack/install")
+async def start_slack_installation():
+    """Start Slack OAuth installation flow"""
+    if not SLACK_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Slack client ID not configured")
+    
+    # Generate state parameter for security
+    state = secrets.token_urlsafe(32)
+    
+    # Slack OAuth URL with required scopes (DM-only scopes)
+    scopes = [
+        "chat:write",
+        "im:history",
+        "im:write",
+        "users:read",
+        "teams:read"
+    ]
+    
+    oauth_params = {
+        "client_id": SLACK_CLIENT_ID,
+        "scope": ",".join(scopes),
+        "redirect_uri": SLACK_REDIRECT_URI,
+        "state": state
+    }
+    
+    oauth_url = f"https://slack.com/oauth/v2/authorize?{urlencode(oauth_params)}"
+    
+    return {
+        "installation_url": oauth_url,
+        "state": state,
+        "message": "Click the URL to install EnableBot to your Slack workspace"
+    }
+
+@app.get("/slack/oauth")
+async def handle_slack_oauth(code: str, state: str = None):
+    """Handle Slack OAuth callback and complete installation"""
+    if not all([SLACK_CLIENT_ID, SLACK_CLIENT_SECRET]):
+        raise HTTPException(status_code=500, detail="Slack OAuth not properly configured")
+    
+    try:
+        # Exchange code for access token
+        oauth_response = await slack_client.post(
+            "https://slack.com/api/oauth.v2.access",
+            data={
+                "client_id": SLACK_CLIENT_ID,
+                "client_secret": SLACK_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": SLACK_REDIRECT_URI
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        
+        oauth_data = oauth_response.json()
+        
+        if not oauth_data.get("ok"):
+            raise HTTPException(status_code=400, detail=f"Slack OAuth failed: {oauth_data.get('error')}")
+        
+        # Extract installation details
+        team_info = oauth_data["team"]
+        bot_info = oauth_data["bot_user"]
+        installer_info = oauth_data["authed_user"]
+        
+        installation = SlackInstallation(
+            team_id=team_info["id"],
+            team_name=team_info["name"],
+            bot_token=oauth_data["access_token"],
+            bot_user_id=bot_info["bot_user_id"],
+            installer_id=installer_info["id"],
+            installer_name=installer_info.get("name", "Unknown"),
+            scopes=oauth_data["scope"].split(",")
+        )
+        
+        # Automatically set up the tenant
+        tenant_created = await create_tenant_from_slack(installation)
+        admin_created = await create_admin_user(installation)
+        docs_created = await create_sample_documents(installation.team_id, installation.team_name)
+        
+        if tenant_created and admin_created:
+            # Send welcome message to installer
+            welcome_message = f"""🎉 Welcome to EnableBot!
+
+Hi {installation.installer_name}! EnableBot has been successfully installed to {installation.team_name}.
+
+WHAT'S NEXT:
+✅ Your workspace is now set up
+✅ You're registered as an admin
+✅ Sample documents have been created
+
+TRY IT OUT:
+• Direct message @EnableBot for private AI assistance
+• Ask: "What can you help me with?"
+• Upload company documents at: {SLACK_REDIRECT_URI.replace('/slack/oauth', '/upload')}
+
+ADMIN FEATURES:
+• Manage users and documents
+• View usage analytics
+• Configure AI behavior
+
+Questions? Just ask @EnableBot: "How do I get started as an admin?"
+
+Happy automating! 🚀"""
+            
+            # Send DM to installer
+            await slack_client.post(
+                "https://slack.com/api/chat.postMessage",
+                json={
+                    "channel": installation.installer_id,
+                    "text": welcome_message
+                },
+                headers={"Authorization": f"Bearer {installation.bot_token}"}
+            )
+            
+            return HTMLResponse(f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>EnableBot Installation Success</title>
+                <style>
+                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+                           max-width: 600px; margin: 50px auto; padding: 20px; text-align: center; }}
+                    .success {{ background: #10b981; color: white; padding: 20px; border-radius: 12px; margin: 20px 0; }}
+                    .info {{ background: #3b82f6; color: white; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+                    .actions {{ margin: 30px 0; }}
+                    .btn {{ display: inline-block; background: #1f2937; color: white; padding: 12px 24px; 
+                           border-radius: 8px; text-decoration: none; margin: 10px; }}
+                </style>
+            </head>
+            <body>
+                <h1>🎉 EnableBot Successfully Installed!</h1>
+                <div class="success">
+                    <h2>✅ Installation Complete</h2>
+                    <p><strong>{installation.team_name}</strong> is now set up with EnableBot!</p>
+                </div>
+                
+                <div class="info">
+                    <h3>What's Been Set Up:</h3>
+                    <p>✅ Workspace: {installation.team_name}<br>
+                       ✅ Admin User: {installation.installer_name}<br>
+                       ✅ Sample Documents Created<br>
+                       ✅ AI Assistant Ready</p>
+                </div>
+                
+                <div class="actions">
+                    <h3>Next Steps:</h3>
+                    <a href="slack://channel?team={installation.team_id}" class="btn">Open Slack</a>
+                    <a href="/upload" class="btn">Upload Documents</a>
+                    <a href="/tenant/{installation.team_id}/users" class="btn">View Dashboard</a>
+                </div>
+                
+                <p><strong>Try it now:</strong> Go to Slack and send a direct message to @EnableBot!</p>
+            </body>
+            </html>
+            """)
+        else:
+            raise HTTPException(status_code=500, detail="Failed to complete workspace setup")
+        
+    except Exception as e:
+        logger.error(f"OAuth callback error: {e}")
+        raise HTTPException(status_code=500, detail=f"Installation failed: {str(e)}")
+
 @app.get("/upload", response_class=HTMLResponse)
 async def upload_page():
     """Document upload interface"""
@@ -733,10 +1186,8 @@ async def upload_page():
             <form id="uploadForm" enctype="multipart/form-data">
                 <div class="form-group">
                     <label for="tenantId">Company/Tenant ID:</label>
-                    <select id="tenantId" name="tenant_id" required>
-                        <option value="">Select Company</option>
-                        <option value="T07ENABLEOPS123">EnableOps</option>
-                    </select>
+                    <input type="text" id="tenantId" name="tenant_id" required placeholder="e.g., T07ABC123XYZ">
+                    <small>Enter your Slack workspace team ID</small>
                 </div>
                 <div class="form-group">
                     <label for="title">Document Title:</label>
