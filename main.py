@@ -999,6 +999,59 @@ async def health_check():
 @app.get("/slack/install")
 async def start_slack_installation():
     """Start Slack OAuth installation flow"""
+    try:
+        if not SLACK_CLIENT_ID:
+            logger.error("SLACK_CLIENT_ID not configured")
+            raise HTTPException(status_code=500, detail="Slack client ID not configured")
+        
+        if not SLACK_REDIRECT_URI:
+            logger.error("SLACK_REDIRECT_URI not configured")
+            raise HTTPException(status_code=500, detail="Slack redirect URI not configured")
+        
+        # Generate state parameter for security
+        state = secrets.token_urlsafe(32)
+        
+        # Slack OAuth URL with required scopes (DM-only scopes)
+        scopes = [
+            "chat:write",
+            "im:read", 
+            "im:write", 
+            "users:read",
+            "teams:read"
+        ]
+        
+        oauth_params = {
+            "client_id": SLACK_CLIENT_ID,
+            "scope": ",".join(scopes),
+            "redirect_uri": SLACK_REDIRECT_URI,
+            "state": state
+        }
+        
+        oauth_url = f"https://slack.com/oauth/v2/authorize?{urlencode(oauth_params)}"
+        
+        logger.info(f"Redirecting to Slack OAuth: {oauth_url}")
+        
+        # Import RedirectResponse locally if needed
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=oauth_url, status_code=302)
+        
+    except Exception as e:
+        logger.error(f"Error in slack install: {e}")
+        # Return a simple HTML page with the link if redirect fails
+        return HTMLResponse(f"""
+        <html>
+        <head><title>Install EnableBot</title></head>
+        <body>
+            <h1>Install EnableBot</h1>
+            <p>Error with automatic redirect. Please click the link below:</p>
+            <a href="https://slack.com/oauth/v2/authorize?client_id={SLACK_CLIENT_ID}&scope=chat:write,im:read,im:write,users:read,teams:read&redirect_uri={SLACK_REDIRECT_URI}">
+                Install EnableBot
+            </a>
+            <p>Error details: {str(e)}</p>
+        </body>
+        </html>
+        """)
+    """Start Slack OAuth installation flow"""
     if not SLACK_CLIENT_ID:
         raise HTTPException(status_code=500, detail="Slack client ID not configured")
     
