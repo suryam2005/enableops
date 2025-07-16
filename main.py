@@ -28,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
-app = FastAPI(title="EnableBot AI Service", version="2.1.0")
+app = FastAPI(title="EnableBot AI AGENT Service", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
