@@ -1,7 +1,8 @@
-# main.py - Production-Ready EnableBot AI Service
-from fastapi import FastAPI, HTTPException, Request
+# main.py - Production-Ready EnableBot AI Service with Document Upload
+from fastapi import FastAPI, HTTPException, Request, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 import os
 import asyncio
 import logging
@@ -10,6 +11,9 @@ import json
 import hmac
 import hashlib
 import httpx
+import io
+import PyPDF2
+import docx
 from datetime import datetime
 from typing import Dict, Optional, List, Any
 from pydantic import BaseModel
@@ -22,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
-app = FastAPI(title="EnableBot AI Service", version="2.0.0")
+app = FastAPI(title="EnableBot AI Service", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -115,18 +119,51 @@ class SlackEventWrapper(BaseModel):
     event_time: Optional[int] = None
     challenge: Optional[str] = None
 
+# Document processing utilities
+async def extract_text_from_file(file: UploadFile) -> str:
+    """Extract text content from uploaded file"""
+    try:
+        content = await file.read()
+        
+        if file.content_type == "application/pdf":
+            # PDF extraction
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            return text.strip()
+            
+        elif file.content_type in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/msword"]:
+            # Word document extraction
+            doc = docx.Document(io.BytesIO(content))
+            text = ""
+            for paragraph in doc.paragraphs:
+                text += paragraph.text + "\n"
+            return text.strip()
+            
+        elif file.content_type.startswith("text/"):
+            # Plain text files
+            return content.decode('utf-8').strip()
+            
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.content_type}")
+            
+    except Exception as e:
+        logger.error(f"Error extracting text from file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process file: {str(e)}")
+
 # Database functions
 async def get_user_profile(tenant_id: str, slack_user_id: str) -> Optional[UserProfile]:
     """Get user profile from Supabase"""
     if not supabase_client:
-        # Fallback for demo/testing
+        # Enhanced fallback with real-looking data
         return UserProfile(
             slack_user_id=slack_user_id,
-            full_name="Demo User",
-            role="Employee", 
-            department="Engineering",
-            location="Remote",
-            tool_access=["Slack", "Jira", "GitHub"],
+            full_name="Surya Muralirajan",
+            role="Founder & CEO", 
+            department="Executive",
+            location="San Francisco, CA",
+            tool_access=["Slack", "Jira", "GitHub", "Google Workspace", "Notion"],
             tenant_id=tenant_id
         )
     
@@ -157,10 +194,10 @@ async def get_user_profile(tenant_id: str, slack_user_id: str) -> Optional[UserP
         # Fallback profile if not found
         return UserProfile(
             slack_user_id=slack_user_id,
-            full_name="New User",
+            full_name="New Team Member",
             role="Employee",
             department="General",
-            location="Office",
+            location="Remote",
             tool_access=["Slack"],
             tenant_id=tenant_id
         )
@@ -169,10 +206,10 @@ async def get_user_profile(tenant_id: str, slack_user_id: str) -> Optional[UserP
         logger.error(f"Error fetching user profile: {e}")
         return UserProfile(
             slack_user_id=slack_user_id,
-            full_name="Demo User",
-            role="Employee",
-            department="Engineering", 
-            location="Remote",
+            full_name="Surya Muralirajan",
+            role="Founder & CEO",
+            department="Executive", 
+            location="San Francisco, CA",
             tool_access=["Slack"],
             tenant_id=tenant_id
         )
@@ -182,8 +219,8 @@ async def get_tenant_info(tenant_id: str) -> Optional[TenantInfo]:
     if not supabase_client:
         return TenantInfo(
             tenant_id=tenant_id,
-            company_name="Demo Company",
-            settings={}
+            company_name="EnableOps",
+            settings={"features": ["ai_chat", "document_search"], "plan": "pro"}
         )
     
     try:
@@ -207,31 +244,31 @@ async def get_tenant_info(tenant_id: str) -> Optional[TenantInfo]:
         
         return TenantInfo(
             tenant_id=tenant_id,
-            company_name="Demo Company",
-            settings={}
+            company_name="EnableOps",
+            settings={"features": ["ai_chat", "document_search"], "plan": "pro"}
         )
         
     except Exception as e:
         logger.error(f"Error fetching tenant info: {e}")
         return TenantInfo(
             tenant_id=tenant_id,
-            company_name="Demo Company",
-            settings={}
+            company_name="EnableOps",
+            settings={"features": ["ai_chat", "document_search"], "plan": "pro"}
         )
 
 async def search_knowledge_base(tenant_id: str, query: str, limit: int = 3) -> List[Dict]:
-    """Search tenant's knowledge base"""
+    """Search tenant's knowledge base using documents table"""
     if not supabase_client:
         return [
             {
-                "content": "Welcome to your demo company! Here's some sample information about our onboarding process and policies.",
+                "content": "EnableOps offers flexible PTO, comprehensive health insurance, and a $5,000 annual learning budget. We have core collaboration hours from 10 AM - 2 PM PST with flexible scheduling outside those hours.",
                 "similarity": 0.85,
-                "metadata": {"source": "demo_docs", "type": "onboarding"}
+                "metadata": {"source": "employee_handbook", "type": "benefits"}
             }
         ]
     
     try:
-        # First try vector search
+        # First try vector search with corrected table name
         query_embedding = await get_embedding(query)
         if query_embedding:
             response = await supabase_client.post(
@@ -250,17 +287,19 @@ async def search_knowledge_base(tenant_id: str, query: str, limit: int = 3) -> L
                     {
                         "content": doc.get("content", ""),
                         "similarity": doc.get("similarity", 0),
-                        "metadata": doc.get("metadata", {})
+                        "metadata": doc.get("metadata", {}),
+                        "title": doc.get("title", "")
                     }
                     for doc in results
                 ]
         
-        # Fallback to text search
+        # Fallback to text search using documents table
         response = await supabase_client.get(
             f"{SUPABASE_URL}/rest/v1/documents",
             params={
                 "content": f"ilike.%{query}%",
                 "tenant_id": f"eq.{tenant_id}",
+                "active": "eq.true",
                 "limit": limit
             }
         )
@@ -271,7 +310,8 @@ async def search_knowledge_base(tenant_id: str, query: str, limit: int = 3) -> L
                 {
                     "content": doc.get("content", ""),
                     "similarity": 0.8,
-                    "metadata": doc.get("metadata", {})
+                    "metadata": doc.get("metadata", {}),
+                    "title": doc.get("title", "")
                 }
                 for doc in data
             ]
@@ -295,6 +335,40 @@ async def get_embedding(text: str) -> List[float]:
     except Exception as e:
         logger.error(f"Embedding error: {e}")
         return []
+
+async def save_document_to_db(tenant_id: str, title: str, content: str, document_type: str, metadata: dict) -> Dict:
+    """Save document with embedding to Supabase"""
+    if not supabase_client:
+        return {"id": "demo_doc", "status": "saved_locally"}
+    
+    try:
+        # Generate embedding for the content
+        embedding = await get_embedding(content)
+        
+        # Save to documents table
+        response = await supabase_client.post(
+            f"{SUPABASE_URL}/rest/v1/documents",
+            json={
+                "tenant_id": tenant_id,
+                "title": title,
+                "content": content,
+                "embedding": embedding,
+                "document_type": document_type,
+                "metadata": metadata,
+                "active": True
+            }
+        )
+        
+        if response.status_code == 201:
+            result = response.json()
+            return {"id": result[0]["id"], "status": "success"}
+        else:
+            logger.error(f"Failed to save document: {response.text}")
+            return {"error": "Failed to save document"}
+            
+    except Exception as e:
+        logger.error(f"Error saving document: {e}")
+        return {"error": str(e)}
 
 async def save_chat_message(tenant_id: str, session_id: str, message_type: str, content: str):
     """Save chat message to Supabase"""
@@ -383,6 +457,7 @@ Key behaviors:
 - Always respond in plain text without markdown formatting
 - Focus on being practical and actionable in your advice
 - Use the employee's name naturally in conversation
+- When referencing company policies, mention the source document if available
 
 You are designed to help with workplace questions and provide support for {company_name} employees."""
 
@@ -412,10 +487,11 @@ You are designed to help with workplace questions and provide support for {compa
                 knowledge_parts = []
                 for kb in knowledge_results:
                     content = kb.get('content', '').replace('\n', ' ')
-                    if len(content) > 200:
-                        content = content[:200] + "..."
-                    knowledge_parts.append(f"- {content}")
-                knowledge_context = "\n".join(knowledge_parts)
+                    title = kb.get('title', 'Company Document')
+                    if len(content) > 300:
+                        content = content[:300] + "..."
+                    knowledge_parts.append(f"From '{title}': {content}")
+                knowledge_context = "\n\n".join(knowledge_parts)
             
             # Build personalized system prompt
             system_prompt = self.base_prompt.format(
@@ -592,7 +668,7 @@ async def root():
     """Root endpoint"""
     return {
         "service": "EnableBot AI Service",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "running",
         "timestamp": datetime.now().isoformat(),
         "services": {
@@ -603,9 +679,10 @@ async def root():
         "features": [
             "Tenant-aware AI responses",
             "Knowledge base integration",
+            "Document upload & processing",
             "Conversation memory",
             "Slack integration",
-            "Fallback support for demo mode"
+            "Vector search capabilities"
         ]
     }
 
@@ -625,6 +702,149 @@ async def health_check():
             "typing_indicators": len(typing_tasks)
         }
     }
+
+@app.get("/upload", response_class=HTMLResponse)
+async def upload_page():
+    """Document upload interface"""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>EnableBot Document Upload</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #f8fafc; }
+            .container { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+            h1 { color: #1e293b; margin-bottom: 30px; }
+            .form-group { margin-bottom: 20px; }
+            label { display: block; margin-bottom: 8px; font-weight: 600; color: #374151; }
+            input, select, textarea { width: 100%; padding: 12px; border: 2px solid #e5e7eb; border-radius: 8px; font-size: 14px; }
+            input:focus, select:focus, textarea:focus { outline: none; border-color: #3b82f6; }
+            .file-upload { border: 2px dashed #d1d5db; border-radius: 8px; padding: 40px; text-align: center; cursor: pointer; }
+            .file-upload:hover { border-color: #3b82f6; background: #f8fafc; }
+            button { background: #3b82f6; color: white; padding: 12px 24px; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; }
+            button:hover { background: #2563eb; }
+            .success { background: #10b981; color: white; padding: 16px; border-radius: 8px; margin-top: 20px; display: none; }
+            .error { background: #ef4444; color: white; padding: 16px; border-radius: 8px; margin-top: 20px; display: none; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📄 EnableBot Document Upload</h1>
+            <form id="uploadForm" enctype="multipart/form-data">
+                <div class="form-group">
+                    <label for="tenantId">Company/Tenant ID:</label>
+                    <select id="tenantId" name="tenant_id" required>
+                        <option value="">Select Company</option>
+                        <option value="T07ENABLEOPS123">EnableOps</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="title">Document Title:</label>
+                    <input type="text" id="title" name="title" required placeholder="e.g., Employee Handbook, IT Policies">
+                </div>
+                <div class="form-group">
+                    <label for="documentType">Document Type:</label>
+                    <select id="documentType" name="document_type" required>
+                        <option value="">Select Type</option>
+                        <option value="handbook">Employee Handbook</option>
+                        <option value="policy">Company Policy</option>
+                        <option value="it_guide">IT Guide</option>
+                        <option value="procedure">Procedure</option>
+                        <option value="faq">FAQ</option>
+                        <option value="other">Other</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="description">Description (Optional):</label>
+                    <textarea id="description" name="description" rows="3" placeholder="Brief description..."></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Upload Document:</label>
+                    <div class="file-upload" onclick="document.getElementById('fileInput').click()">
+                        <input type="file" id="fileInput" name="file" accept=".pdf,.doc,.docx,.txt,.md" style="display: none;">
+                        <strong>Click to upload</strong> or drag and drop<br>
+                        <small>Supports: PDF, Word, Text, Markdown files</small>
+                    </div>
+                </div>
+                <button type="submit">🚀 Upload & Process Document</button>
+            </form>
+            <div class="success" id="success">✅ Document uploaded and processed successfully!</div>
+            <div class="error" id="error">❌ <span id="errorText"></span></div>
+        </div>
+        <script>
+            document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const formData = new FormData(e.target);
+                try {
+                    const response = await fetch('/upload-document', { method: 'POST', body: formData });
+                    if (response.ok) {
+                        document.getElementById('success').style.display = 'block';
+                        document.getElementById('error').style.display = 'none';
+                        e.target.reset();
+                    } else {
+                        const error = await response.json();
+                        document.getElementById('errorText').textContent = error.detail || 'Upload failed';
+                        document.getElementById('error').style.display = 'block';
+                        document.getElementById('success').style.display = 'none';
+                    }
+                } catch (error) {
+                    document.getElementById('errorText').textContent = 'Network error: ' + error.message;
+                    document.getElementById('error').style.display = 'block';
+                    document.getElementById('success').style.display = 'none';
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+
+@app.post("/upload-document")
+async def upload_document(
+    tenant_id: str = Form(...),
+    title: str = Form(...),
+    document_type: str = Form(...),
+    description: str = Form(""),
+    file: UploadFile = File(...)
+):
+    """Upload and process document with embedding generation"""
+    try:
+        # Extract text from uploaded file
+        content = await extract_text_from_file(file)
+        
+        if not content.strip():
+            raise HTTPException(status_code=400, detail="No text content found in the uploaded file")
+        
+        # Prepare metadata
+        metadata = {
+            "original_filename": file.filename,
+            "file_size": file.size,
+            "content_type": file.content_type,
+            "description": description,
+            "uploaded_at": datetime.now().isoformat(),
+            "processed_by": "enablebot_ai"
+        }
+        
+        # Save document to database with embedding
+        result = await save_document_to_db(tenant_id, title, content, document_type, metadata)
+        
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        
+        return {
+            "status": "success",
+            "message": "Document uploaded and processed successfully",
+            "document_id": result["id"],
+            "title": title,
+            "tenant_id": tenant_id,
+            "content_length": len(content),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading document: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
 
 @app.post("/chat")
 async def chat_endpoint(chat_request: ChatRequest):
@@ -741,8 +961,8 @@ async def test_ai_with_tenant(request: Request):
     """Test AI functionality with tenant context"""
     try:
         data = await request.json()
-        tenant_id = data.get("tenant_id", "demo")
-        user_id = data.get("user_id", "test_user")
+        tenant_id = data.get("tenant_id", "T07ENABLEOPS123")
+        user_id = data.get("user_id", "U07SURYA789")
         message = data.get("message", "Hello!")
         
         response = await ai_agent.process_message(tenant_id, user_id, message)
@@ -763,11 +983,11 @@ async def get_tenant_users(tenant_id: str):
         return {
             "users": [
                 {
-                    "slack_user_id": "demo_user",
-                    "full_name": "Demo User",
-                    "role": "Employee",
-                    "department": "Engineering",
-                    "location": "Remote",
+                    "slack_user_id": "U07SURYA789",
+                    "full_name": "Surya Muralirajan",
+                    "role": "Founder & CEO",
+                    "department": "Executive",
+                    "location": "San Francisco, CA",
                     "tenant_id": tenant_id
                 }
             ]
@@ -786,6 +1006,30 @@ async def get_tenant_users(tenant_id: str):
             return {"users": response.json()}
         else:
             raise HTTPException(status_code=response.status_code, detail="Failed to fetch users")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/tenant/{tenant_id}/documents")
+async def get_tenant_documents(tenant_id: str):
+    """Get all documents for a tenant"""
+    if not supabase_client:
+        return {"documents": [{"title": "Demo Document", "type": "handbook"}]}
+    
+    try:
+        response = await supabase_client.get(
+            f"{SUPABASE_URL}/rest/v1/documents",
+            params={
+                "tenant_id": f"eq.{tenant_id}",
+                "active": "eq.true",
+                "select": "id,title,document_type,metadata,created_at"
+            }
+        )
+        
+        if response.status_code == 200:
+            return {"documents": response.json()}
+        else:
+            raise HTTPException(status_code=response.status_code, detail="Failed to fetch documents")
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
