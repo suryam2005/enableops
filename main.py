@@ -921,8 +921,8 @@ async def root_with_install():
             <div class="hero">
                 <h1>🤖 EnableBot</h1>
                 <p>AI-powered assistant for your Slack workspace</p>
-                <a href="/slack/install" class="install-btn">
-                    <img src="https://platform.slack-edge.com/img/add_to_slack.png" alt="Add to Slack" width="139" height="40">
+                <a href="https://slack.com/oauth/v2/authorize?client_id=9084308602437.9132650605636&scope=chat:write,im:history,im:read,im:write,users:read,team:read&user_scope=">
+                    <img alt="Add to Slack" height="40" width="139" src="https://platform.slack-edge.com/img/add_to_slack.png" srcSet="https://platform.slack-edge.com/img/add_to_slack.png 1x, https://platform.slack-edge.com/img/add_to_slack@2x.png 2x" />
                 </a>
             </div>
             
@@ -999,85 +999,6 @@ async def health_check():
 @app.get("/slack/install")
 async def start_slack_installation():
     """Start Slack OAuth installation flow"""
-    try:
-        if not SLACK_CLIENT_ID:
-            logger.error("SLACK_CLIENT_ID not configured")
-            raise HTTPException(status_code=500, detail="Slack client ID not configured")
-        
-        if not SLACK_REDIRECT_URI:
-            logger.error("SLACK_REDIRECT_URI not configured")
-            raise HTTPException(status_code=500, detail="Slack redirect URI not configured")
-        
-        # Generate state parameter for security
-        state = secrets.token_urlsafe(32)
-        
-        # Slack OAuth URL with required scopes (DM-only scopes)
-        scopes = [
-            "chat:write",
-            "im:read", 
-            "im:write", 
-            "users:read",
-            "teams:read"
-        ]
-        
-        oauth_params = {
-            "client_id": SLACK_CLIENT_ID,
-            "scope": ",".join(scopes),
-            "redirect_uri": SLACK_REDIRECT_URI,
-            "state": state
-        }
-        
-        oauth_url = f"https://slack.com/oauth/v2/authorize?{urlencode(oauth_params)}"
-        
-        logger.info(f"Redirecting to Slack OAuth: {oauth_url}")
-        
-        # Import RedirectResponse locally if needed
-        from fastapi.responses import RedirectResponse
-        return RedirectResponse(url=oauth_url, status_code=302)
-        
-    except Exception as e:
-        logger.error(f"Error in slack install: {e}")
-        # Return a simple HTML page with the link if redirect fails
-        return HTMLResponse(f"""
-        <html>
-        <head><title>Install EnableBot</title></head>
-        <body>
-            <h1>Install EnableBot</h1>
-            <p>Error with automatic redirect. Please click the link below:</p>
-            <a href="https://slack.com/oauth/v2/authorize?client_id={SLACK_CLIENT_ID}&scope=chat:write,im:read,im:write,users:read,teams:read&redirect_uri={SLACK_REDIRECT_URI}">
-                Install EnableBot
-            </a>
-            <p>Error details: {str(e)}</p>
-        </body>
-        </html>
-        """)
-    """Start Slack OAuth installation flow"""
-    if not SLACK_CLIENT_ID:
-        raise HTTPException(status_code=500, detail="Slack client ID not configured")
-    
-    # Generate state parameter for security
-    state = secrets.token_urlsafe(32)
-    
-    # Updated scopes to match your Slack app configuration
-    scopes = [
-        "chat:write",
-        "im:read",      # Changed from im:history
-        "im:write", 
-        "users:read",
-        "teams:read"
-    ]
-    
-    oauth_params = {
-        "client_id": SLACK_CLIENT_ID,
-        "scope": ",".join(scopes),
-        "redirect_uri": SLACK_REDIRECT_URI,
-        "state": state
-    }
-    
-    oauth_url = f"https://slack.com/oauth/v2/authorize?{urlencode(oauth_params)}"
-    
-    return RedirectResponse(url=oauth_url, status_code=302)
-    """Start Slack OAuth installation flow"""
     if not SLACK_CLIENT_ID:
         raise HTTPException(status_code=500, detail="Slack client ID not configured")
     
@@ -1113,8 +1034,11 @@ async def handle_slack_oauth(code: str, state: str = None):
         raise HTTPException(status_code=500, detail="Slack OAuth not properly configured")
     
     try:
+        # Create a temporary client for OAuth
+        oauth_client = httpx.AsyncClient(timeout=30.0)
+        
         # Exchange code for access token
-        oauth_response = await slack_client.post(
+        oauth_response = await oauth_client.post(
             "https://slack.com/api/oauth.v2.access",
             data={
                 "client_id": SLACK_CLIENT_ID,
@@ -1128,31 +1052,54 @@ async def handle_slack_oauth(code: str, state: str = None):
         oauth_data = oauth_response.json()
         
         if not oauth_data.get("ok"):
+            logger.error(f"Slack OAuth failed: {oauth_data}")
             raise HTTPException(status_code=400, detail=f"Slack OAuth failed: {oauth_data.get('error')}")
         
-        # Extract installation details
+        # Debug: Log the full OAuth response structure
+        logger.info(f"OAuth response keys: {list(oauth_data.keys())}")
+        if 'bot_user' in oauth_data:
+            logger.info(f"bot_user keys: {list(oauth_data['bot_user'].keys())}")
+        
+        # Extract installation details with flexible structure handling
         team_info = oauth_data["team"]
-        bot_info = oauth_data["bot_user"]
+        
+        # Handle different bot_user structures
+        if "bot_user" in oauth_data:
+            bot_info = oauth_data["bot_user"]
+            bot_user_id = bot_info.get("bot_user_id") or bot_info.get("id")
+        else:
+            # Fallback if bot_user is missing
+            bot_user_id = oauth_data.get("bot_user_id", "unknown")
+        
         installer_info = oauth_data["authed_user"]
+        
+        # Get bot token - could be in different places
+        bot_token = oauth_data.get("access_token") or oauth_data.get("bot", {}).get("bot_access_token")
         
         installation = SlackInstallation(
             team_id=team_info["id"],
             team_name=team_info["name"],
-            bot_token=oauth_data["access_token"],
-            bot_user_id=bot_info["bot_user_id"],
+            bot_token=bot_token,
+            bot_user_id=bot_user_id,
             installer_id=installer_info["id"],
             installer_name=installer_info.get("name", "Unknown"),
-            scopes=oauth_data["scope"].split(",")
+            scopes=oauth_data.get("scope", "").split(",")
         )
+        
+        # Close temporary client
+        await oauth_client.aclose()
         
         # Automatically set up the tenant
         tenant_created = await create_tenant_from_slack(installation)
         admin_created = await create_admin_user(installation)
         docs_created = await create_sample_documents(installation.team_id, installation.team_name)
         
-        if tenant_created and admin_created:
-            # Send welcome message to installer
-            welcome_message = f"""🎉 Welcome to EnableBot!
+        # Send welcome message if we have a valid bot token
+        welcome_sent = False
+        if bot_token and bot_user_id != "unknown":
+            try:
+                welcome_client = httpx.AsyncClient(timeout=30.0)
+                welcome_message = f"""🎉 Welcome to EnableBot!
 
 Hi {installation.installer_name}! EnableBot has been successfully installed to {installation.team_name}.
 
@@ -1164,74 +1111,90 @@ WHAT'S NEXT:
 TRY IT OUT:
 • Direct message @EnableBot for private AI assistance
 • Ask: "What can you help me with?"
-• Upload company documents at: {SLACK_REDIRECT_URI.replace('/slack/oauth', '/upload')}
-
-ADMIN FEATURES:
-• Manage users and documents
-• View usage analytics
-• Configure AI behavior
+• Upload company documents at: https://enableops-backend.madrasco.space/upload
 
 Questions? Just ask @EnableBot: "How do I get started as an admin?"
 
 Happy automating! 🚀"""
+                
+                await welcome_client.post(
+                    "https://slack.com/api/chat.postMessage",
+                    json={
+                        "channel": installation.installer_id,
+                        "text": welcome_message
+                    },
+                    headers={"Authorization": f"Bearer {bot_token}"}
+                )
+                await welcome_client.aclose()
+                welcome_sent = True
+            except Exception as e:
+                logger.error(f"Failed to send welcome message: {e}")
+        
+        return HTMLResponse(f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>EnableBot Installation Success</title>
+            <style>
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+                       max-width: 600px; margin: 50px auto; padding: 20px; text-align: center; }}
+                .success {{ background: #10b981; color: white; padding: 20px; border-radius: 12px; margin: 20px 0; }}
+                .info {{ background: #3b82f6; color: white; padding: 15px; border-radius: 8px; margin: 20px 0; }}
+                .actions {{ margin: 30px 0; }}
+                .btn {{ display: inline-block; background: #1f2937; color: white; padding: 12px 24px; 
+                       border-radius: 8px; text-decoration: none; margin: 10px; }}
+                .debug {{ background: #f3f4f6; padding: 15px; border-radius: 8px; margin: 20px 0; font-family: monospace; font-size: 12px; }}
+            </style>
+        </head>
+        <body>
+            <h1>🎉 EnableBot Successfully Installed!</h1>
+            <div class="success">
+                <h2>✅ Installation Complete</h2>
+                <p><strong>{installation.team_name}</strong> is now set up with EnableBot!</p>
+            </div>
             
-            # Send DM to installer
-            await slack_client.post(
-                "https://slack.com/api/chat.postMessage",
-                json={
-                    "channel": installation.installer_id,
-                    "text": welcome_message
-                },
-                headers={"Authorization": f"Bearer {installation.bot_token}"}
-            )
+            <div class="info">
+                <h3>What's Been Set Up:</h3>
+                <p>✅ Workspace: {installation.team_name}<br>
+                   ✅ Admin User: {installation.installer_name}<br>
+                   ✅ Tenant Created: {tenant_created}<br>
+                   ✅ Admin Profile: {admin_created}<br>
+                   ✅ Sample Documents: {docs_created}<br>
+                   ✅ Welcome Message: {welcome_sent}</p>
+            </div>
             
-            return HTMLResponse(f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>EnableBot Installation Success</title>
-                <style>
-                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
-                           max-width: 600px; margin: 50px auto; padding: 20px; text-align: center; }}
-                    .success {{ background: #10b981; color: white; padding: 20px; border-radius: 12px; margin: 20px 0; }}
-                    .info {{ background: #3b82f6; color: white; padding: 15px; border-radius: 8px; margin: 20px 0; }}
-                    .actions {{ margin: 30px 0; }}
-                    .btn {{ display: inline-block; background: #1f2937; color: white; padding: 12px 24px; 
-                           border-radius: 8px; text-decoration: none; margin: 10px; }}
-                </style>
-            </head>
-            <body>
-                <h1>🎉 EnableBot Successfully Installed!</h1>
-                <div class="success">
-                    <h2>✅ Installation Complete</h2>
-                    <p><strong>{installation.team_name}</strong> is now set up with EnableBot!</p>
-                </div>
-                
-                <div class="info">
-                    <h3>What's Been Set Up:</h3>
-                    <p>✅ Workspace: {installation.team_name}<br>
-                       ✅ Admin User: {installation.installer_name}<br>
-                       ✅ Sample Documents Created<br>
-                       ✅ AI Assistant Ready</p>
-                </div>
-                
-                <div class="actions">
-                    <h3>Next Steps:</h3>
-                    <a href="slack://channel?team={installation.team_id}" class="btn">Open Slack</a>
-                    <a href="/upload" class="btn">Upload Documents</a>
-                    <a href="/tenant/{installation.team_id}/users" class="btn">View Dashboard</a>
-                </div>
-                
-                <p><strong>Try it now:</strong> Go to Slack and send a direct message to @EnableBot!</p>
-            </body>
-            </html>
-            """)
-        else:
-            raise HTTPException(status_code=500, detail="Failed to complete workspace setup")
+            <div class="actions">
+                <h3>Next Steps:</h3>
+                <a href="slack://channel?team={installation.team_id}" class="btn">Open Slack</a>
+                <a href="/upload" class="btn">Upload Documents</a>
+                <a href="/tenant/{installation.team_id}/users" class="btn">View Dashboard</a>
+            </div>
+            
+            <p><strong>Try it now:</strong> Go to Slack and send a direct message to @EnableBot!</p>
+            
+            <div class="debug">
+                <strong>Debug Info:</strong><br>
+                Team ID: {installation.team_id}<br>
+                Bot User ID: {installation.bot_user_id}<br>
+                Installer: {installation.installer_id}<br>
+                Scopes: {", ".join(installation.scopes)}
+            </div>
+        </body>
+        </html>
+        """)
         
     except Exception as e:
         logger.error(f"OAuth callback error: {e}")
-        raise HTTPException(status_code=500, detail=f"Installation failed: {str(e)}")
+        return HTMLResponse(f"""
+        <html><body style="text-align: center; padding: 50px; font-family: Arial, sans-serif;">
+        <h1>🚨 Installation Error</h1>
+        <div style="background: #ef4444; color: white; padding: 20px; border-radius: 8px; margin: 20px;">
+            <p><strong>Error:</strong> {str(e)}</p>
+        </div>
+        <p>Please check the logs and try again.</p>
+        <a href="/" style="background: #3b82f6; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px;">Back to Home</a>
+        </body></html>
+        """, status_code=500)
 
 @app.get("/upload", response_class=HTMLResponse)
 async def upload_page():
