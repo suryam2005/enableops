@@ -1424,6 +1424,41 @@ async def handle_slack_events(request: Request):
 async def process_slack_message(tenant_id: str, channel: str, user: str, text: str):
     """Process Slack message with tenant context"""
     try:
+        # Use the original channel ID from the webhook (DM channel ID)
+        response_channel = channel  # This is the DM channel ID (starts with D)
+        
+        logger.info(f"Processing message: channel={channel}, user={user}, responding to channel={response_channel}")
+        
+        # Start typing indicator in the correct DM channel
+        typing = TypingIndicator(slack_api, response_channel)
+        typing_tasks[f"{response_channel}_{user}"] = typing
+        
+        await typing.start()
+        
+        # Generate AI response with tenant context
+        ai_response = await ai_agent.process_message(tenant_id, user, text)
+        
+        # Send final response to the DM channel
+        await typing.stop_and_respond(ai_response)
+        
+        # Clean up
+        if f"{response_channel}_{user}" in typing_tasks:
+            del typing_tasks[f"{response_channel}_{user}"]
+        
+        logger.info(f"✅ Processed message from {user} in tenant {tenant_id}, responded to {response_channel}")
+        
+    except Exception as e:
+        logger.error(f"Error processing message: {e}")
+        # Try to send error message to the original channel
+        try:
+            await slack_api.send_message(
+                channel,  # Use original channel from webhook
+                "I'm sorry, I encountered an error processing your message. Please try again."
+            )
+        except Exception as send_error:
+            logger.error(f"Failed to send error message: {send_error}")
+    """Process Slack message with tenant context"""
+    try:
         # Start typing indicator
         typing = TypingIndicator(slack_api, channel)
         typing_tasks[f"{channel}_{user}"] = typing
