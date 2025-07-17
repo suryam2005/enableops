@@ -886,7 +886,7 @@ class TypingIndicator:
 
 # Initialize components
 ai_agent = TenantAwareAI()
-slack_api = SlackAPI()
+# slack_api = SlackAPI()  # Remove this - we don't need it anymore
 
 def verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
     """Verify Slack request signature"""
@@ -1478,6 +1478,212 @@ async def test_ai_with_tenant(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/dashboard", response_class=HTMLResponse)
+async def admin_dashboard():
+    """Admin dashboard to view all installations and bot tokens"""
+    try:
+        if not supabase_client:
+            return HTMLResponse("""
+            <html><body style="text-align: center; padding: 50px;">
+            <h1>Dashboard Unavailable</h1>
+            <p>Supabase not connected. Cannot display installation data.</p>
+            <a href="/">Back to Home</a>
+            </body></html>
+            """)
+        
+        # Get all tenants
+        tenants_response = await supabase_client.get(
+            f"{SUPABASE_URL}/rest/v1/tenants",
+            params={"order": "created_at.desc"}
+        )
+        
+        tenants = []
+        if tenants_response.status_code == 200:
+            tenants = tenants_response.json()
+        
+        # Get installation events
+        events_response = await supabase_client.get(
+            f"{SUPABASE_URL}/rest/v1/installation_events",
+            params={"order": "created_at.desc", "limit": "10"}
+        )
+        
+        events = []
+        if events_response.status_code == 200:
+            events = events_response.json()
+        
+        # Generate dashboard HTML
+        tenants_html = ""
+        for tenant in tenants:
+            access_token = tenant.get('access_token', 'Not Available')
+            token_preview = f"{access_token[:20]}..." if access_token and access_token != 'Not Available' else 'Missing'
+            status_color = "#10b981" if access_token and access_token != 'Not Available' else "#ef4444"
+            
+            tenants_html += f"""
+            <tr>
+                <td>{tenant.get('team_name', 'Unknown')}</td>
+                <td><code>{tenant.get('team_id', 'Unknown')}</code></td>
+                <td><span style="color: {status_color}; font-weight: bold;">{token_preview}</span></td>
+                <td>{tenant.get('installer_name', 'Unknown')}</td>
+                <td>{tenant.get('plan', 'free')}</td>
+                <td>{tenant.get('created_at', 'Unknown')[:19] if tenant.get('created_at') else 'Unknown'}</td>
+                <td>
+                    <a href="/tenant/{tenant.get('team_id')}/users" style="color: #3b82f6;">View Users</a> |
+                    <a href="/tenant/{tenant.get('team_id')}/documents" style="color: #3b82f6;">View Docs</a>
+                </td>
+            </tr>
+            """
+        
+        events_html = ""
+        for event in events[:5]:  # Last 5 events
+            metadata = event.get('metadata', {})
+            events_html += f"""
+            <tr>
+                <td>{event.get('event_type', 'unknown')}</td>
+                <td>{event.get('team_name', 'Unknown')}</td>
+                <td>{event.get('installer_name', 'Unknown')}</td>
+                <td>{metadata.get('bot_token_preview', 'No token')}</td>
+                <td>{event.get('created_at', 'Unknown')[:19] if event.get('created_at') else 'Unknown'}</td>
+            </tr>
+            """
+        
+        return HTMLResponse(f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>EnableBot Admin Dashboard</title>
+            <style>
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+                       max-width: 1200px; margin: 0 auto; padding: 20px; background: #f8fafc; }}
+                .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px; }}
+                h1, h2 {{ color: #1e293b; }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+                th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #e5e7eb; }}
+                th {{ background: #f8fafc; font-weight: 600; }}
+                .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }}
+                .stat {{ background: #3b82f6; color: white; padding: 20px; border-radius: 8px; text-align: center; }}
+                .stat h3 {{ margin: 0; font-size: 2em; }}
+                .stat p {{ margin: 5px 0 0 0; }}
+                .nav {{ margin-bottom: 30px; }}
+                .nav a {{ background: #3b82f6; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none; margin-right: 10px; }}
+                .nav a:hover {{ background: #2563eb; }}
+                code {{ background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-family: monospace; }}
+                .token {{ font-family: monospace; font-size: 12px; }}
+            </style>
+        </head>
+        <body>
+            <div class="nav">
+                <a href="/">🏠 Home</a>
+                <a href="/upload">📄 Upload Documents</a>
+                <a href="/api">🔌 API Status</a>
+                <a href="/health">❤️ Health Check</a>
+            </div>
+
+            <div class="container">
+                <h1>🤖 EnableBot Admin Dashboard</h1>
+                
+                <div class="stats">
+                    <div class="stat">
+                        <h3>{len(tenants)}</h3>
+                        <p>Installed Workspaces</p>
+                    </div>
+                    <div class="stat">
+                        <h3>{len([t for t in tenants if t.get('access_token') and t.get('access_token') != 'Not Available'])}</h3>
+                        <p>Active Bot Tokens</p>
+                    </div>
+                    <div class="stat">
+                        <h3>{len(events)}</h3>
+                        <p>Installation Events</p>
+                    </div>
+                    <div class="stat">
+                        <h3>{len([t for t in tenants if t.get('active', True)])}</h3>
+                        <p>Active Tenants</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="container">
+                <h2>📊 Installed Workspaces</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Workspace Name</th>
+                            <th>Team ID</th>
+                            <th>Bot Token</th>
+                            <th>Installed By</th>
+                            <th>Plan</th>
+                            <th>Installed</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {tenants_html if tenants_html else '<tr><td colspan="7" style="text-align: center; color: #6b7280;">No installations found</td></tr>'}
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="container">
+                <h2>📋 Recent Installation Events</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Event Type</th>
+                            <th>Workspace</th>
+                            <th>Installed By</th>
+                            <th>Bot Token Preview</th>
+                            <th>Date</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {events_html if events_html else '<tr><td colspan="5" style="text-align: center; color: #6b7280;">No events found</td></tr>'}
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="container">
+                <h2>🔧 Quick Actions</h2>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                    <a href="/" style="background: #10b981; color: white; padding: 15px; border-radius: 8px; text-decoration: none; text-align: center;">
+                        🔗 Add New Workspace
+                    </a>
+                    <a href="/upload" style="background: #f59e0b; color: white; padding: 15px; border-radius: 8px; text-decoration: none; text-align: center;">
+                        📄 Upload Documents
+                    </a>
+                    <a href="/stats" style="background: #8b5cf6; color: white; padding: 15px; border-radius: 8px; text-decoration: none; text-align: center;">
+                        📈 View Statistics
+                    </a>
+                    <a href="/health" style="background: #06b6d4; color: white; padding: 15px; border-radius: 8px; text-decoration: none; text-align: center;">
+                        ❤️ System Health
+                    </a>
+                </div>
+            </div>
+
+            <div class="container">
+                <h2>💡 Tips</h2>
+                <ul>
+                    <li><strong>Missing Bot Token?</strong> Reinstall the app to that workspace</li>
+                    <li><strong>Bot Not Responding?</strong> Check if the bot token is active in the workspace</li>
+                    <li><strong>Need Help?</strong> Check the Railway logs for detailed error messages</li>
+                    <li><strong>Add Documents:</strong> Use the Upload Documents page to add company knowledge</li>
+                </ul>
+            </div>
+
+            <div style="text-align: center; margin-top: 30px; color: #6b7280;">
+                <p>EnableBot v2.1.0 • Powered by Railway + Supabase + OpenAI</p>
+            </div>
+        </body>
+        </html>
+        """)
+        
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}")
+        return HTMLResponse(f"""
+        <html><body style="text-align: center; padding: 50px;">
+        <h1>Dashboard Error</h1>
+        <p>Error loading dashboard: {str(e)}</p>
+        <a href="/">Back to Home</a>
+        </body></html>
+        """, status_code=500)
+
 @app.get("/tenant/{tenant_id}/users")
 async def get_tenant_users(tenant_id: str):
     """Get all users for a tenant"""
@@ -1486,7 +1692,7 @@ async def get_tenant_users(tenant_id: str):
             "users": [
                 {
                     "slack_user_id": "U07SURYA789",
-                    "full_name": "Surya Muralirajan",
+                    "full_name": "Surya Muralirajan", 
                     "role": "Founder & CEO",
                     "department": "Executive",
                     "location": "San Francisco, CA",
@@ -1510,13 +1716,7 @@ async def get_tenant_users(tenant_id: str):
             raise HTTPException(status_code=response.status_code, detail="Failed to fetch users")
             
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/tenant/{tenant_id}/documents")
-async def get_tenant_documents(tenant_id: str):
-    """Get all documents for a tenant"""
-    if not supabase_client:
-        return {"documents": [{"title": "Demo Document", "type": "handbook"}]}
+        raise HTTPException(status_code=500, detail=str(e))type": "handbook"}]}
     
     try:
         response = await supabase_client.get(
