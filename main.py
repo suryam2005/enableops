@@ -1514,11 +1514,11 @@ async def admin_dashboard():
         # Generate dashboard HTML
         tenants_html = ""
         for tenant in tenants:
-            access_token = tenant.get('access_token', 'Not Available')
-            token_preview = f"{access_token[:20]}..." if access_token and access_token != 'Not Available' else 'Missing'
-            status_color = "#10b981" if access_token and access_token != 'Not Available' else "#ef4444"
+            access_token = tenant.get('access_token', '')
+            token_preview = f"{access_token[:20]}..." if access_token else 'Missing'
+            status_color = "#10b981" if access_token else "#ef4444"
             
-            tenants_html += f"""
+            tenants_html += f'''
             <tr>
                 <td>{tenant.get('team_name', 'Unknown')}</td>
                 <td><code>{tenant.get('team_id', 'Unknown')}</code></td>
@@ -1526,17 +1526,13 @@ async def admin_dashboard():
                 <td>{tenant.get('installer_name', 'Unknown')}</td>
                 <td>{tenant.get('plan', 'free')}</td>
                 <td>{tenant.get('created_at', 'Unknown')[:19] if tenant.get('created_at') else 'Unknown'}</td>
-                <td>
-                    <a href="/tenant/{tenant.get('team_id')}/users" style="color: #3b82f6;">View Users</a> |
-                    <a href="/tenant/{tenant.get('team_id')}/documents" style="color: #3b82f6;">View Docs</a>
-                </td>
             </tr>
-            """
+            '''
         
         events_html = ""
         for event in events[:5]:  # Last 5 events
             metadata = event.get('metadata', {})
-            events_html += f"""
+            events_html += f'''
             <tr>
                 <td>{event.get('event_type', 'unknown')}</td>
                 <td>{event.get('team_name', 'Unknown')}</td>
@@ -1544,7 +1540,7 @@ async def admin_dashboard():
                 <td>{metadata.get('bot_token_preview', 'No token')}</td>
                 <td>{event.get('created_at', 'Unknown')[:19] if event.get('created_at') else 'Unknown'}</td>
             </tr>
-            """
+            '''
         
         return HTMLResponse(f"""
         <!DOCTYPE html>
@@ -1552,22 +1548,38 @@ async def admin_dashboard():
         <head>
             <title>EnableBot Admin Dashboard</title>
             <style>
-                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
-                       max-width: 1200px; margin: 0 auto; padding: 20px; background: #f8fafc; }}
-                .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px; }}
+                body {{ 
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+                    max-width: 1200px; margin: 0 auto; padding: 20px; background: #f8fafc; 
+                }}
+                .container {{ 
+                    background: white; padding: 30px; border-radius: 12px; 
+                    box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px; 
+                }}
                 h1, h2 {{ color: #1e293b; }}
                 table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
                 th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #e5e7eb; }}
                 th {{ background: #f8fafc; font-weight: 600; }}
-                .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }}
-                .stat {{ background: #3b82f6; color: white; padding: 20px; border-radius: 8px; text-align: center; }}
+                .stats {{ 
+                    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
+                    gap: 20px; margin-bottom: 30px; 
+                }}
+                .stat {{ 
+                    background: #3b82f6; color: white; padding: 20px; 
+                    border-radius: 8px; text-align: center; 
+                }}
                 .stat h3 {{ margin: 0; font-size: 2em; }}
                 .stat p {{ margin: 5px 0 0 0; }}
                 .nav {{ margin-bottom: 30px; }}
-                .nav a {{ background: #3b82f6; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none; margin-right: 10px; }}
+                .nav a {{ 
+                    background: #3b82f6; color: white; padding: 10px 20px; 
+                    border-radius: 6px; text-decoration: none; margin-right: 10px; 
+                }}
                 .nav a:hover {{ background: #2563eb; }}
-                code {{ background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-family: monospace; }}
-                .token {{ font-family: monospace; font-size: 12px; }}
+                code {{ 
+                    background: #f1f5f9; padding: 2px 6px; border-radius: 4px; 
+                    font-family: monospace; 
+                }}
             </style>
         </head>
         <body>
@@ -1587,7 +1599,7 @@ async def admin_dashboard():
                         <p>Installed Workspaces</p>
                     </div>
                     <div class="stat">
-                        <h3>{len([t for t in tenants if t.get('access_token') and t.get('access_token') != 'Not Available'])}</h3>
+                        <h3>{len([t for t in tenants if t.get('access_token')])}</h3>
                         <p>Active Bot Tokens</p>
                     </div>
                     <div class="stat">
@@ -1608,15 +1620,14 @@ async def admin_dashboard():
                         <tr>
                             <th>Workspace Name</th>
                             <th>Team ID</th>
-                            <th>Bot Token</th>
+                            <th>Bot Token Status</th>
                             <th>Installed By</th>
                             <th>Plan</th>
-                            <th>Installed</th>
-                            <th>Actions</th>
+                            <th>Installed Date</th>
                         </tr>
                     </thead>
                     <tbody>
-                        {tenants_html if tenants_html else '<tr><td colspan="7" style="text-align: center; color: #6b7280;">No installations found</td></tr>'}
+                        {tenants_html if tenants_html else '<tr><td colspan="6">No installations found</td></tr>'}
                     </tbody>
                 </table>
             </div>
@@ -1634,37 +1645,9 @@ async def admin_dashboard():
                         </tr>
                     </thead>
                     <tbody>
-                        {events_html if events_html else '<tr><td colspan="5" style="text-align: center; color: #6b7280;">No events found</td></tr>'}
+                        {events_html if events_html else '<tr><td colspan="5">No events found</td></tr>'}
                     </tbody>
                 </table>
-            </div>
-
-            <div class="container">
-                <h2>🔧 Quick Actions</h2>
-                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
-                    <a href="/" style="background: #10b981; color: white; padding: 15px; border-radius: 8px; text-decoration: none; text-align: center;">
-                        🔗 Add New Workspace
-                    </a>
-                    <a href="/upload" style="background: #f59e0b; color: white; padding: 15px; border-radius: 8px; text-decoration: none; text-align: center;">
-                        📄 Upload Documents
-                    </a>
-                    <a href="/stats" style="background: #8b5cf6; color: white; padding: 15px; border-radius: 8px; text-decoration: none; text-align: center;">
-                        📈 View Statistics
-                    </a>
-                    <a href="/health" style="background: #06b6d4; color: white; padding: 15px; border-radius: 8px; text-decoration: none; text-align: center;">
-                        ❤️ System Health
-                    </a>
-                </div>
-            </div>
-
-            <div class="container">
-                <h2>💡 Tips</h2>
-                <ul>
-                    <li><strong>Missing Bot Token?</strong> Reinstall the app to that workspace</li>
-                    <li><strong>Bot Not Responding?</strong> Check if the bot token is active in the workspace</li>
-                    <li><strong>Need Help?</strong> Check the Railway logs for detailed error messages</li>
-                    <li><strong>Add Documents:</strong> Use the Upload Documents page to add company knowledge</li>
-                </ul>
             </div>
 
             <div style="text-align: center; margin-top: 30px; color: #6b7280;">
