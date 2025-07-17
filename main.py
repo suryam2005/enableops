@@ -28,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
-app = FastAPI(title="EnableBot AI Agent Service", version="2.1.0")
+app = FastAPI(title="EnableBot AI Service", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -853,6 +853,8 @@ class TypingIndicator:
                         self.message_ts, 
                         "⚡ Processing your request..."
                     )
+            else:
+                logger.error(f"Failed to start typing indicator: {result.get('error')}")
                 
         except Exception as e:
             logger.error(f"Error starting typing indicator: {e}")
@@ -862,16 +864,25 @@ class TypingIndicator:
         self.is_active = False
         try:
             if self.message_ts:
-                await self.slack_api.update_message(
+                # Try to update the existing message
+                success = await self.slack_api.update_message(
                     self.channel,
                     self.message_ts,
                     final_message
                 )
+                if not success:
+                    # If update fails, send a new message
+                    await self.slack_api.send_message(self.channel, final_message)
             else:
+                # No existing message, send new one
                 await self.slack_api.send_message(self.channel, final_message)
         except Exception as e:
-            logger.error(f"Error updating final message: {e}")
-            await self.slack_api.send_message(self.channel, final_message)
+            logger.error(f"Error in stop_and_respond: {e}")
+            # Last resort: try to send message directly
+            try:
+                await self.slack_api.send_message(self.channel, final_message)
+            except Exception as final_error:
+                logger.error(f"Final fallback failed: {final_error}")
 
 # Initialize components
 ai_agent = TenantAwareAI()
