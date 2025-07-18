@@ -47,7 +47,7 @@ async def get_database_url() -> str:
     return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
 async def init_database():
-    """Initialize database connection pool"""
+    """Initialize database connection pool and create tables"""
     global db_pool
     try:
         database_url = await get_database_url()
@@ -57,6 +57,46 @@ async def init_database():
             max_size=5,
             command_timeout=60
         )
+        
+        # Create tables if they don't exist
+        async with db_pool.acquire() as conn:
+            # Read and execute the schema SQL
+            schema_path = os.path.join(os.path.dirname(__file__), "..", "shared", "database", "migrations", "001_create_multi_tenant_schema.sql")
+            try:
+                with open(schema_path, 'r') as f:
+                    schema_sql = f.read()
+                await conn.execute(schema_sql)
+                logger.info("✅ Database schema initialized")
+            except FileNotFoundError:
+                logger.warning("⚠️ Schema file not found, creating basic tables")
+                # Create basic tables if schema file is missing
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS tenants (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        team_id VARCHAR(20) UNIQUE NOT NULL,
+                        team_name VARCHAR(255) NOT NULL,
+                        encrypted_bot_token TEXT NOT NULL,
+                        encryption_key_id VARCHAR(255) NOT NULL,
+                        bot_user_id VARCHAR(20),
+                        installer_user_id VARCHAR(20),
+                        installer_name VARCHAR(255),
+                        scopes JSONB DEFAULT '[]'::jsonb,
+                        status VARCHAR(20) DEFAULT 'active',
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    );
+                    
+                    CREATE TABLE IF NOT EXISTS installation_events (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        team_id VARCHAR(20) NOT NULL,
+                        event_type VARCHAR(50) NOT NULL,
+                        installer_user_id VARCHAR(20),
+                        installer_name VARCHAR(255),
+                        metadata JSONB DEFAULT '{}'::jsonb,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    );
+                """)
+        
         logger.info("✅ Database connection pool initialized")
         return True
     except Exception as e:
@@ -240,7 +280,6 @@ async def slack_oauth_callback(
             raise HTTPException(status_code=500, detail="Slack OAuth credentials not configured")
         
         # Exchange authorization code for access token
-        import httpx
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 "https://slack.com/api/oauth.v2.access",
