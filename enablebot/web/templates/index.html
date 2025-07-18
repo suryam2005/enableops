@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EnableBot - Slack AI Assistant</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+</head>
+<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <!-- Header -->
+        <header class="text-center mb-12">
+            <div class="flex items-center justify-center mb-6">
+                <i class="fas fa-robot text-4xl text-indigo-600 mr-3"></i>
+                <h1 class="text-4xl font-bold text-gray-800">EnableBot</h1>
+            </div>
+            <p class="text-xl text-gray-600 max-w-2xl mx-auto">
+                Your intelligent Slack AI assistant for workplace productivity and knowledge management
+            </p>
+        </header>
+
+        <!-- Main Content -->
+        <div class="max-w-4xl mx-auto">
+            <!-- Features Section -->
+            <div class="grid md:grid-cols-3 gap-8 mb-12">
+                <div class="bg-white rounded-lg shadow-lg p-6 text-center">
+                    <i class="fas fa-brain text-3xl text-purple-600 mb-4"></i>
+                    <h3 class="text-xl font-semibold mb-2">AI-Powered Assistance</h3>
+                    <p class="text-gray-600">Get instant answers to workplace questions using advanced AI technology</p>
+                </div>
+                <div class="bg-white rounded-lg shadow-lg p-6 text-center">
+                    <i class="fas fa-shield-alt text-3xl text-green-600 mb-4"></i>
+                    <h3 class="text-xl font-semibold mb-2">Secure & Private</h3>
+                    <p class="text-gray-600">Enterprise-grade security with encrypted token storage and audit logging</p>
+                </div>
+                <div class="bg-white rounded-lg shadow-lg p-6 text-center">
+                    <i class="fas fa-users text-3xl text-blue-600 mb-4"></i>
+                    <h3 class="text-xl font-semibold mb-2">Multi-Tenant</h3>
+                    <p class="text-gray-600">Isolated workspaces for each team with personalized knowledge bases</p>
+                </div>
+            </div>
+
+            <!-- Installation Section -->
+            <div class="bg-white rounded-lg shadow-xl p-8 text-center">
+                <h2 class="text-3xl font-bold text-gray-800 mb-6">Get Started with EnableBot</h2>
+                <p class="text-lg text-gray-600 mb-8">
+                    Install EnableBot to your Slack workspace and start getting AI-powered assistance for your team
+                </p>
+                
+                <!-- Slack Install Button -->
+                <div class="mb-8">
+                    <a href="/slack/install" 
+                       class="inline-flex items-center px-8 py-4 bg-slack-green hover:bg-green-600 text-white font-semibold rounded-lg shadow-lg transition-colors duration-200 text-lg">
+                        <i class="fab fa-slack text-2xl mr-3"></i>
+                        Add to Slack
+                    </a>
+                </div>
+
+                <!-- How it works -->
+                <div class="border-t pt-8">
+                    <h3 class="text-xl font-semibold mb-4">How it works:</h3>
+                    <div class="grid md:grid-cols-3 gap-6 text-left">
+                        <div class="flex items-start">
+                            <div class="bg-indigo-100 rounded-full p-2 mr-3 mt-1">
+                                <span class="text-indigo-600 font-bold">1</span>
+                            </div>
+                            <div>
+                                <h4 class="font-semibold">Install to Slack</h4>
+                                <p class="text-sm text-gray-600">Click "Add to Slack" and authorize EnableBot for your workspace</p>
+                            </div>
+                        </div>
+                        <div class="flex items-start">
+                            <div class="bg-indigo-100 rounded-full p-2 mr-3 mt-1">
+                                <span class="text-indigo-600 font-bold">2</span>
+                            </div>
+                            <div>
+                                <h4 class="font-semibold">Configure Settings</h4>
+                                <p class="text-sm text-gray-600">Set up your team preferences and upload knowledge documents</p>
+                            </div>
+                        </div>
+                        <div class="flex items-start">
+                            <div class="bg-indigo-100 rounded-full p-2 mr-3 mt-1">
+                                <span class="text-indigo-600 font-bold">3</span>
+                            </div>
+                            <div>
+                                <h4 class="font-semibold">Start Chatting</h4>
+                                <p class="text-sm text-gray-600">Message @EnableBot in Slack to get AI-powered assistance</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Status Section -->
+            <div class="mt-8 text-center">
+                <div class="inline-flex items-center bg-green-100 text-green-800 px-4 py-2 rounded-full">
+                    <i class="fas fa-check-circle mr-2"></i>
+                    <span class="font-medium">System Status: All services operational</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <style>
+        .bg-slack-green {
+            background-color: #4A154B;
+        }
+        .bg-slack-green:hover {
+            background-color: #611f69;
+        }
+    </style>
+</body>
+</html>

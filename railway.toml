@@ -2,9 +2,11 @@
 builder = "nixpacks"
 
 [deploy]
+startCommand = "python enablebot/scripts/start_web.py"
 healthcheckPath = "/health"
-healthcheckTimeout = 30
+healthcheckTimeout = 300
 restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
 
-[experimental]
-incrementalBuild = true
+[environments.production]
+variables = { }
