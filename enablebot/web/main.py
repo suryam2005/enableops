@@ -25,8 +25,35 @@ app = FastAPI(
     version="3.0.0"
 )
 
-# Templates
-templates = Jinja2Templates(directory="enablebot/web/templates")
+# Templates - handle different working directories
+import os
+from pathlib import Path
+
+# Get the directory of this file
+current_dir = Path(__file__).parent
+templates_dir = current_dir / "templates"
+
+# Fallback paths for different deployment scenarios
+possible_template_paths = [
+    str(templates_dir),  # Relative to this file
+    "enablebot/web/templates",  # From project root
+    "./enablebot/web/templates",  # Explicit relative
+]
+
+# Find the correct templates directory
+templates_path = None
+for path in possible_template_paths:
+    if os.path.exists(path) and os.path.isdir(path):
+        templates_path = path
+        break
+
+if not templates_path:
+    # Create a fallback if templates not found
+    templates_path = str(templates_dir)
+    logger.warning(f"Templates directory not found, using: {templates_path}")
+
+logger.info(f"Using templates directory: {templates_path}")
+templates = Jinja2Templates(directory=templates_path)
 
 @app.on_event("startup")
 async def startup_event():
