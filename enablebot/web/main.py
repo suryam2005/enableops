@@ -212,7 +212,7 @@ async def slack_install():
     if not slack_client_id:
         raise HTTPException(status_code=500, detail="Slack Client ID not configured")
     
-    install_url = f"https://slack.com/oauth/v2/authorize?client_id={slack_client_id}&scope=app_mentions:read,chat:write,im:history,im:read,im:write,users:read&user_scope="
+    install_url = f"https://slack.com/oauth/v2/authorize?client_id={slack_client_id}&scope=chat:write,im:history,im:read,im:write,team:read,users:read&user_scope="
     return RedirectResponse(url=install_url)
 
 @app.get("/slack/oauth/callback")
@@ -260,7 +260,26 @@ async def slack_oauth_callback(
             bot_token = oauth_response.get("access_token")
             bot_user_id = oauth_response.get("bot_user_id")
             installer_user_id = oauth_response.get("authed_user", {}).get("id", "unknown")
+            installer_access_token = oauth_response.get("authed_user", {}).get("access_token")
             scopes = oauth_response.get("scope", "").split(",")
+            
+            # Get installer's name from Slack API
+            installer_name = "Unknown User"
+            if installer_access_token and installer_user_id != "unknown":
+                try:
+                    async with httpx.AsyncClient() as client:
+                        user_response = await client.get(
+                            "https://slack.com/api/users.info",
+                            headers={"Authorization": f"Bearer {installer_access_token}"},
+                            params={"user": installer_user_id}
+                        )
+                        user_data = user_response.json()
+                        if user_data.get("ok") and user_data.get("user"):
+                            user_profile = user_data["user"].get("profile", {})
+                            installer_name = user_profile.get("display_name") or user_profile.get("real_name") or user_data["user"].get("name", "Unknown User")
+                            logger.info(f"✅ Retrieved installer name: {installer_name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not retrieve installer name: {e}")
             
             # Prepare installation data for storage
             installation_data = {
@@ -269,7 +288,7 @@ async def slack_oauth_callback(
                 "bot_token": bot_token,
                 "bot_user_id": bot_user_id,
                 "installer_user_id": installer_user_id,
-                "installer_name": "Unknown User",  # We'll get this from Slack API later
+                "installer_name": installer_name,
                 "scopes": scopes,
                 "installation_source": "web_oauth"
             }
@@ -284,24 +303,63 @@ async def slack_oauth_callback(
                 logger.warning(f"⚠️ EnableBot installed for team {team_name} but failed to store in database")
                 storage_status = "⚠️ Installation successful but data storage failed"
             
-            # Show success page with storage status
+            # Get the Slack workspace URL for redirect
+            slack_workspace_url = f"https://{team_name.lower().replace(' ', '')}.slack.com"
+            if 'team' in oauth_response and 'url' in oauth_response['team']:
+                slack_workspace_url = oauth_response['team']['url']
+            
+            # Show success page with auto-redirect to Slack
             return HTMLResponse(f"""
             <html>
-                <head><title>EnableBot Installation Successful</title></head>
+                <head>
+                    <title>EnableBot Installation Successful</title>
+                    <script>
+                        // Auto-redirect to Slack after 3 seconds
+                        setTimeout(function() {{
+                            window.open('{slack_workspace_url}', '_blank');
+                            // Also redirect current page back to home
+                            setTimeout(function() {{
+                                window.location.href = '/';
+                            }}, 1000);
+                        }}, 3000);
+                    </script>
+                </head>
                 <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
                     <h1>🎉 EnableBot Installation Successful!</h1>
                     <p><strong>{team_name}</strong> workspace is now connected to EnableBot.</p>
                     <p>Bot User ID: <code>{bot_user_id}</code></p>
-                    <p>You can now send direct messages to <strong>@EnableBot</strong> in Slack!</p>
+                    <p>{storage_status}</p>
+                    
+                    <div style="margin: 30px 0; padding: 20px; background: #e8f5e8; border-radius: 8px; border: 2px solid #4caf50;">
+                        <h3>🚀 Redirecting to Slack...</h3>
+                        <p>You will be automatically redirected to your Slack workspace in <span id="countdown">3</span> seconds.</p>
+                        <p>If the redirect doesn't work, <a href="{slack_workspace_url}" target="_blank" style="color: #4A154B; font-weight: bold;">click here to open Slack</a></p>
+                    </div>
+                    
                     <div style="margin: 30px 0; padding: 20px; background: #f0f8ff; border-radius: 8px;">
-                        <h3>Next Steps:</h3>
+                        <h3>Next Steps in Slack:</h3>
                         <ol style="text-align: left; display: inline-block;">
-                            <li>Go to your Slack workspace</li>
-                            <li>Send a direct message to @EnableBot</li>
+                            <li>Look for <strong>@EnableOps</strong> in your Apps section</li>
+                            <li>Send a direct message to @EnableOps</li>
                             <li>Start chatting with your AI assistant!</li>
                         </ol>
                     </div>
+                    
                     <p><a href="/" style="color: #4A154B; text-decoration: none;">← Back to Home</a></p>
+                    
+                    <script>
+                        // Countdown timer
+                        let countdown = 3;
+                        const countdownElement = document.getElementById('countdown');
+                        const timer = setInterval(function() {{
+                            countdown--;
+                            countdownElement.textContent = countdown;
+                            if (countdown <= 0) {{
+                                clearInterval(timer);
+                                countdownElement.textContent = 'now';
+                            }}
+                        }}, 1000);
+                    </script>
                 </body>
             </html>
             """)
