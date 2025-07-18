@@ -1,1 +1,1 @@
-web: python -m uvicorn enablebot.api.main:app --host 0.0.0.0 --port $PORT
+web: python -m uvicorn enablebot.web.main:app --host 0.0.0.0 --port $PORT
