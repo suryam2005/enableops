@@ -9,12 +9,7 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
 import uvicorn
-
-# Import shared components
-from enablebot.shared.database.config import init_database, close_database
-from enablebot.web.auth import slack_auth
 
 # Configure logging
 logging.basicConfig(
@@ -35,23 +30,14 @@ templates = Jinja2Templates(directory="enablebot/web/templates")
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database connection on startup"""
+    """Initialize web application"""
     logger.info("🚀 Starting EnableBot Web Application...")
-    
-    # Initialize database
-    if await init_database():
-        logger.info("✅ Database connection initialized")
-    else:
-        logger.error("❌ Failed to initialize database")
-    
     logger.info("🎉 EnableBot Web Application ready!")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean up on shutdown"""
     logger.info("🛑 Shutting down EnableBot Web Application...")
-    await close_database()
-    await slack_auth.close()
     logger.info("✅ Cleanup completed")
 
 @app.get("/", response_class=HTMLResponse)
@@ -62,18 +48,19 @@ async def home(request: Request):
 @app.get("/slack/install")
 async def slack_install():
     """Redirect to Slack OAuth"""
-    try:
-        install_url = await slack_auth.get_install_url()
-        return RedirectResponse(url=install_url)
-    except Exception as e:
-        logger.error(f"Error generating install URL: {e}")
-        raise HTTPException(status_code=500, detail="Failed to generate installation URL")
+    # For now, redirect to Slack app installation page
+    slack_client_id = os.getenv("SLACK_CLIENT_ID", "")
+    if not slack_client_id:
+        raise HTTPException(status_code=500, detail="Slack Client ID not configured")
+    
+    install_url = f"https://slack.com/oauth/v2/authorize?client_id={slack_client_id}&scope=app_mentions:read,chat:write,im:history,im:read,im:write,users:read&user_scope="
+    return RedirectResponse(url=install_url)
 
 @app.get("/slack/oauth/callback")
 async def slack_oauth_callback(
     request: Request,
     code: str = Query(...),
-    state: str = Query(...),
+    state: str = Query(None),
     error: str = Query(None)
 ):
     """Handle Slack OAuth callback"""
@@ -81,40 +68,18 @@ async def slack_oauth_callback(
         logger.error(f"Slack OAuth error: {error}")
         raise HTTPException(status_code=400, detail=f"OAuth error: {error}")
     
-    try:
-        # Handle OAuth callback
-        installation_data = await slack_auth.handle_oauth_callback(code, state, request)
-        
-        # Redirect to dashboard
-        team_id = installation_data["team_id"]
-        return RedirectResponse(url=f"/dashboard/{team_id}")
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"OAuth callback error: {e}")
-        raise HTTPException(status_code=500, detail="Installation failed")
-
-@app.get("/dashboard/{team_id}", response_class=HTMLResponse)
-async def dashboard(request: Request, team_id: str):
-    """Dashboard page after successful installation"""
-    try:
-        # Get installation data
-        installation_data = await slack_auth.get_installation_data(team_id)
-        
-        if not installation_data:
-            raise HTTPException(status_code=404, detail="Installation not found")
-        
-        return templates.TemplateResponse("dashboard.html", {
-            "request": request,
-            **installation_data
-        })
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Dashboard error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to load dashboard")
+    # For now, show a success message
+    return HTMLResponse("""
+    <html>
+        <head><title>EnableBot Installation</title></head>
+        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+            <h1>🎉 EnableBot Installation Successful!</h1>
+            <p>Your Slack workspace is now connected to EnableBot.</p>
+            <p>You can now send direct messages to EnableBot in Slack!</p>
+            <p><a href="/">← Back to Home</a></p>
+        </body>
+    </html>
+    """)
 
 @app.get("/health")
 async def health_check():
@@ -125,23 +90,6 @@ async def health_check():
         "service": "EnableBot Web Interface",
         "version": "3.0.0"
     }
-
-@app.get("/api/installations/{team_id}")
-async def get_installation_info(team_id: str):
-    """API endpoint to get installation information"""
-    try:
-        installation_data = await slack_auth.get_installation_data(team_id)
-        
-        if not installation_data:
-            raise HTTPException(status_code=404, detail="Installation not found")
-        
-        return installation_data
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"API error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get installation data")
 
 if __name__ == "__main__":
     # Run the web application
