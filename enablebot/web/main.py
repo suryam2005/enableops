@@ -60,6 +60,8 @@ async def init_supabase():
         logger.error(f"❌ Failed to initialize Supabase: {e}")
         return False
 
+
+
 async def encrypt_token(token: str, tenant_id: str) -> tuple[str, str]:
     """Simple token encryption (basic implementation)"""
     import base64
@@ -89,17 +91,15 @@ async def store_installation(installation_data: Dict[str, Any]) -> bool:
             installation_data["team_id"]
         )
         
-        # Prepare tenant data for Supabase
+        # Prepare tenant data for Supabase (matching existing schema)
         tenant_data = {
             "team_id": installation_data["team_id"],
             "team_name": installation_data["team_name"],
-            "encrypted_bot_token": encrypted_token,
-            "encryption_key_id": encryption_key,
+            "access_token": encrypted_token,  # Using access_token column instead of encrypted_bot_token
             "bot_user_id": installation_data["bot_user_id"],
-            "installer_user_id": installation_data.get("installer_user_id", "unknown"),
+            "installed_by": installation_data.get("installer_user_id", "unknown"),
             "installer_name": installation_data.get("installer_name", "Unknown User"),
-            "scopes": installation_data.get("scopes", []),
-            "status": "active"
+            "active": True
         }
         
         # Store tenant data using Supabase REST API (upsert)
@@ -113,11 +113,12 @@ async def store_installation(installation_data: Dict[str, Any]) -> bool:
             logger.error(f"Failed to store tenant data: {response.status_code} - {response.text}")
             return False
         
-        # Store installation event
+        # Store installation event (matching existing schema)
         event_data = {
             "team_id": installation_data["team_id"],
+            "team_name": installation_data["team_name"],
             "event_type": "app_installed",
-            "installer_user_id": installation_data.get("installer_user_id", "unknown"),
+            "installed_by": installation_data.get("installer_user_id", "unknown"),
             "installer_name": installation_data.get("installer_name", "Unknown User"),
             "metadata": {
                 "bot_user_id": installation_data["bot_user_id"],
