@@ -270,3 +270,6 @@ Thumbs.db
 .env.development.local
 .env.test.local
 .env.production.local
+
+# Test files (contains mock tokens that trigger GitHub security)
+enablebot/tests/
