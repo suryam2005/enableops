@@ -1,4 +1,3 @@
 """
-EnableBot Scripts
-Startup and utility scripts
+EnableBot Startup Scripts
 """
