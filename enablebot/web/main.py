@@ -22,85 +22,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Database connection
-db_pool = None
+# Supabase client
+supabase_client = None
 
-async def get_database_url() -> str:
-    """Construct database URL from environment variables"""
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_service_key = os.getenv("SUPABASE_SERVICE_KEY")
-    supabase_db_password = os.getenv("SUPABASE_DB_PASSWORD")
-    
-    if not supabase_url or not supabase_service_key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
-    
-    # Extract project ID from Supabase URL
-    project_id = supabase_url.split("//")[1].split(".")[0]
-    
-    # Use service key as password if no specific DB password is provided
-    db_password = supabase_db_password or supabase_service_key
-    db_user = "postgres"
-    db_host = f"db.{project_id}.supabase.co"
-    db_port = "5432"
-    db_name = "postgres"
-    
-    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-
-async def init_database():
-    """Initialize database connection pool and create tables"""
-    global db_pool
+async def init_supabase():
+    """Initialize Supabase REST API client"""
+    global supabase_client
     try:
-        database_url = await get_database_url()
-        db_pool = await asyncpg.create_pool(
-            database_url,
-            min_size=1,
-            max_size=5,
-            command_timeout=60
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_service_key = os.getenv("SUPABASE_SERVICE_KEY")
+        
+        if not supabase_url or not supabase_service_key:
+            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
+        
+        # Create HTTP client for Supabase REST API
+        supabase_client = httpx.AsyncClient(
+            base_url=supabase_url,
+            headers={
+                "apikey": supabase_service_key,
+                "Authorization": f"Bearer {supabase_service_key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal"
+            },
+            timeout=30.0
         )
         
-        # Create tables if they don't exist
-        async with db_pool.acquire() as conn:
-            # Read and execute the schema SQL
-            schema_path = os.path.join(os.path.dirname(__file__), "..", "shared", "database", "migrations", "001_create_multi_tenant_schema.sql")
-            try:
-                with open(schema_path, 'r') as f:
-                    schema_sql = f.read()
-                await conn.execute(schema_sql)
-                logger.info("✅ Database schema initialized")
-            except FileNotFoundError:
-                logger.warning("⚠️ Schema file not found, creating basic tables")
-                # Create basic tables if schema file is missing
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS tenants (
-                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                        team_id VARCHAR(20) UNIQUE NOT NULL,
-                        team_name VARCHAR(255) NOT NULL,
-                        encrypted_bot_token TEXT NOT NULL,
-                        encryption_key_id VARCHAR(255) NOT NULL,
-                        bot_user_id VARCHAR(20),
-                        installer_user_id VARCHAR(20),
-                        installer_name VARCHAR(255),
-                        scopes JSONB DEFAULT '[]'::jsonb,
-                        status VARCHAR(20) DEFAULT 'active',
-                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-                    );
-                    
-                    CREATE TABLE IF NOT EXISTS installation_events (
-                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                        team_id VARCHAR(20) NOT NULL,
-                        event_type VARCHAR(50) NOT NULL,
-                        installer_user_id VARCHAR(20),
-                        installer_name VARCHAR(255),
-                        metadata JSONB DEFAULT '{}'::jsonb,
-                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-                    );
-                """)
-        
-        logger.info("✅ Database connection pool initialized")
-        return True
+        # Test connection by making a simple request
+        response = await supabase_client.get("/rest/v1/")
+        if response.status_code == 200:
+            logger.info("✅ Supabase REST API connection initialized")
+            return True
+        else:
+            logger.error(f"❌ Supabase connection test failed: {response.status_code}")
+            return False
+            
     except Exception as e:
-        logger.error(f"❌ Failed to initialize database: {e}")
+        logger.error(f"❌ Failed to initialize Supabase: {e}")
         return False
 
 async def encrypt_token(token: str, tenant_id: str) -> tuple[str, str]:
@@ -120,69 +77,67 @@ async def encrypt_token(token: str, tenant_id: str) -> tuple[str, str]:
     return base64.b64encode(encrypted_token).decode(), base64.b64encode(key).decode()
 
 async def store_installation(installation_data: Dict[str, Any]) -> bool:
-    """Store installation data in Supabase"""
-    if not db_pool:
-        logger.error("Database pool not initialized")
+    """Store installation data in Supabase using REST API"""
+    if not supabase_client:
+        logger.error("Supabase client not initialized")
         return False
     
     try:
-        async with db_pool.acquire() as conn:
-            # Encrypt the bot token
-            encrypted_token, encryption_key = await encrypt_token(
-                installation_data["bot_token"], 
-                installation_data["team_id"]
-            )
-            
-            # Store tenant data
-            await conn.execute("""
-                INSERT INTO tenants (
-                    team_id, team_name, encrypted_bot_token, encryption_key_id,
-                    bot_user_id, installer_user_id, installer_name, 
-                    scopes, status, created_at, updated_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
-                ON CONFLICT (team_id) DO UPDATE SET
-                    team_name = EXCLUDED.team_name,
-                    encrypted_bot_token = EXCLUDED.encrypted_bot_token,
-                    encryption_key_id = EXCLUDED.encryption_key_id,
-                    bot_user_id = EXCLUDED.bot_user_id,
-                    installer_user_id = EXCLUDED.installer_user_id,
-                    installer_name = EXCLUDED.installer_name,
-                    scopes = EXCLUDED.scopes,
-                    status = EXCLUDED.status,
-                    updated_at = NOW()
-            """, 
-                installation_data["team_id"],
-                installation_data["team_name"],
-                encrypted_token,
-                encryption_key,  # Using encryption key as key_id for simplicity
-                installation_data["bot_user_id"],
-                installation_data.get("installer_user_id", "unknown"),
-                installation_data.get("installer_name", "Unknown User"),
-                json.dumps(installation_data.get("scopes", [])),
-                "active"
-            )
-            
-            # Store installation event
-            await conn.execute("""
-                INSERT INTO installation_events (
-                    team_id, event_type, installer_user_id, installer_name,
-                    metadata, created_at
-                ) VALUES ($1, $2, $3, $4, $5, NOW())
-            """,
-                installation_data["team_id"],
-                "app_installed",
-                installation_data.get("installer_user_id", "unknown"),
-                installation_data.get("installer_name", "Unknown User"),
-                json.dumps({
-                    "bot_user_id": installation_data["bot_user_id"],
-                    "scopes": installation_data.get("scopes", []),
-                    "installation_source": "web_oauth"
-                })
-            )
-            
-            logger.info(f"✅ Stored installation data for team {installation_data['team_id']}")
-            return True
-            
+        # Encrypt the bot token
+        encrypted_token, encryption_key = await encrypt_token(
+            installation_data["bot_token"], 
+            installation_data["team_id"]
+        )
+        
+        # Prepare tenant data for Supabase
+        tenant_data = {
+            "team_id": installation_data["team_id"],
+            "team_name": installation_data["team_name"],
+            "encrypted_bot_token": encrypted_token,
+            "encryption_key_id": encryption_key,
+            "bot_user_id": installation_data["bot_user_id"],
+            "installer_user_id": installation_data.get("installer_user_id", "unknown"),
+            "installer_name": installation_data.get("installer_name", "Unknown User"),
+            "scopes": installation_data.get("scopes", []),
+            "status": "active"
+        }
+        
+        # Store tenant data using Supabase REST API (upsert)
+        response = await supabase_client.post(
+            "/rest/v1/tenants",
+            json=tenant_data,
+            headers={"Prefer": "resolution=merge-duplicates"}
+        )
+        
+        if response.status_code not in [200, 201]:
+            logger.error(f"Failed to store tenant data: {response.status_code} - {response.text}")
+            return False
+        
+        # Store installation event
+        event_data = {
+            "team_id": installation_data["team_id"],
+            "event_type": "app_installed",
+            "installer_user_id": installation_data.get("installer_user_id", "unknown"),
+            "installer_name": installation_data.get("installer_name", "Unknown User"),
+            "metadata": {
+                "bot_user_id": installation_data["bot_user_id"],
+                "scopes": installation_data.get("scopes", []),
+                "installation_source": "web_oauth"
+            }
+        }
+        
+        response = await supabase_client.post(
+            "/rest/v1/installation_events",
+            json=event_data
+        )
+        
+        if response.status_code not in [200, 201]:
+            logger.warning(f"Failed to store installation event: {response.status_code} - {response.text}")
+            # Don't fail the whole operation if event logging fails
+        
+        logger.info(f"✅ Stored installation data for team {installation_data['team_id']}")
+        return True
+        
     except Exception as e:
         logger.error(f"❌ Failed to store installation data: {e}")
         return False
@@ -229,11 +184,11 @@ async def startup_event():
     """Initialize web application"""
     logger.info("🚀 Starting EnableBot Web Application...")
     
-    # Initialize database connection
-    if await init_database():
-        logger.info("✅ Database connection initialized")
+    # Initialize Supabase connection
+    if await init_supabase():
+        logger.info("✅ Supabase connection initialized")
     else:
-        logger.warning("⚠️ Database connection failed - continuing without database")
+        logger.warning("⚠️ Supabase connection failed - continuing without database")
     
     logger.info("🎉 EnableBot Web Application ready!")
 
