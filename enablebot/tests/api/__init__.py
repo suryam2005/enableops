@@ -1,3 +1,0 @@
-"""
-API Service Tests
-"""
