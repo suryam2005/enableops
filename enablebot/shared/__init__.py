@@ -1,4 +1,4 @@
 """
-Shared components for EnableBot
-Database, encryption, and models
+EnableBot Shared Components
+Database, encryption, and common utilities
 """

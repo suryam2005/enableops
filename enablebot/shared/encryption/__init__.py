@@ -1,0 +1,3 @@
+"""
+Encryption layer for EnableBot
+"""
