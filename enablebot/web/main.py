@@ -103,15 +103,27 @@ async def store_installation(installation_data: Dict[str, Any]) -> bool:
         }
         
         # Store tenant data using Supabase REST API (upsert)
-        response = await supabase_client.post(
+        # First try to update existing record
+        update_response = await supabase_client.patch(
             "/rest/v1/tenants",
             json=tenant_data,
-            headers={"Prefer": "resolution=merge-duplicates"}
+            params={"team_id": f"eq.{installation_data['team_id']}"}
         )
         
-        if response.status_code not in [200, 201]:
-            logger.error(f"Failed to store tenant data: {response.status_code} - {response.text}")
-            return False
+        if update_response.status_code in [200, 204]:
+            logger.info(f"✅ Updated existing tenant data for team {installation_data['team_id']}")
+        else:
+            # If update fails, try to insert new record
+            insert_response = await supabase_client.post(
+                "/rest/v1/tenants",
+                json=tenant_data
+            )
+            
+            if insert_response.status_code not in [200, 201]:
+                logger.error(f"Failed to store tenant data: {insert_response.status_code} - {insert_response.text}")
+                return False
+            else:
+                logger.info(f"✅ Inserted new tenant data for team {installation_data['team_id']}")
         
         # Store installation event (matching existing schema)
         event_data = {
