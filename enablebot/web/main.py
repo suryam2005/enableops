@@ -1,14 +1,15 @@
 """
-EnableBot Web Interface
+EnableOps Web Interface
 Handles Slack OAuth, dashboard, and installation flow
 """
 
 import os
 import logging
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Request, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Request, Query, Depends, Header
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import httpx
 import asyncpg
@@ -157,9 +158,18 @@ async def store_installation(installation_data: Dict[str, Any]) -> bool:
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="EnableBot Web Interface",
-    description="Slack OAuth and Dashboard for EnableBot AI Assistant",
+    title="EnableOps Web Interface",
+    description="Slack OAuth and Dashboard for EnableOps AI Assistant",
     version="3.0.0"
+)
+
+# Add CORS middleware for Supabase Auth
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify your domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Templates - handle different working directories
@@ -192,10 +202,68 @@ if not templates_path:
 logger.info(f"Using templates directory: {templates_path}")
 templates = Jinja2Templates(directory=templates_path)
 
+# Authentication helpers
+async def verify_supabase_token(authorization: str = Header(None)):
+    """Verify Supabase JWT token"""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header missing")
+    
+    try:
+        # Extract token from "Bearer <token>"
+        token = authorization.split(" ")[1] if authorization.startswith("Bearer ") else authorization
+        
+        # Verify token with Supabase
+        response = await supabase_client.get(
+            "/auth/v1/user",
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        
+        user_data = response.json()
+        return user_data
+        
+    except Exception as e:
+        logger.error(f"Token verification error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+async def get_user_workspaces(user_email: str):
+    """Get workspaces associated with user email"""
+    if not supabase_client:
+        return []
+    
+    try:
+        # Query tenants where installer email matches or user has access
+        response = await supabase_client.get(
+            "/rest/v1/tenants",
+            params={"active": "eq.true"}
+        )
+        
+        if response.status_code == 200:
+            tenants = response.json()
+            # Filter by user email or other criteria
+            user_workspaces = []
+            for tenant in tenants:
+                # Add logic to check if user has access to this workspace
+                # For now, return all active workspaces
+                user_workspaces.append({
+                    "team_id": tenant["team_id"],
+                    "team_name": tenant["team_name"],
+                    "role": "admin" if tenant.get("installed_by") == user_email else "member"
+                })
+            return user_workspaces
+        
+        return []
+        
+    except Exception as e:
+        logger.error(f"Error getting user workspaces: {e}")
+        return []
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize web application"""
-    logger.info("🚀 Starting EnableBot Web Application...")
+    logger.info("🚀 Starting EnableOps Web Application...")
     
     # Initialize Supabase connection
     if await init_supabase():
@@ -203,18 +271,121 @@ async def startup_event():
     else:
         logger.warning("⚠️ Supabase connection failed - continuing without database")
     
-    logger.info("🎉 EnableBot Web Application ready!")
+    logger.info("🎉 EnableOps Web Application ready!")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean up on shutdown"""
-    logger.info("🛑 Shutting down EnableBot Web Application...")
+    logger.info("🛑 Shutting down EnableOps Web Application...")
     logger.info("✅ Cleanup completed")
 
 @app.get("/", response_class=HTMLResponse)
+async def landing_page(request: Request):
+    """Landing page with signup/signin"""
+    return templates.TemplateResponse("landingpage.html", {"request": request})
+
+@app.get("/home", response_class=HTMLResponse)
 async def home(request: Request):
-    """Home page with Slack installation"""
-    return templates.TemplateResponse("index.html", {"request": request})
+    """Protected home page with Slack installation (after auth)"""
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "supabase_url": os.getenv("SUPABASE_URL", ""),
+        "supabase_anon_key": os.getenv("SUPABASE_ANON_KEY", "")
+    })
+
+@app.get("/auth", response_class=HTMLResponse)
+async def auth_page(request: Request):
+    """Authentication page with Supabase Auth"""
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_anon_key = os.getenv("SUPABASE_ANON_KEY", "")
+    
+    return templates.TemplateResponse("auth.html", {
+        "request": request,
+        "supabase_url": supabase_url,
+        "supabase_anon_key": supabase_anon_key
+    })
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def general_dashboard(request: Request):
+    """General dashboard for authenticated users"""
+    return templates.TemplateResponse("user_dashboard.html", {
+        "request": request,
+        "supabase_url": os.getenv("SUPABASE_URL", ""),
+        "supabase_anon_key": os.getenv("SUPABASE_ANON_KEY", "")
+    })
+
+@app.get("/api/user/workspaces")
+async def get_user_workspaces_api(user: dict = Depends(verify_supabase_token)):
+    """API endpoint to get user's workspaces"""
+    try:
+        user_email = user.get("email", "")
+        workspaces = await get_user_workspaces(user_email)
+        
+        return JSONResponse({
+            "success": True,
+            "workspaces": workspaces,
+            "user": {
+                "email": user_email,
+                "name": user.get("user_metadata", {}).get("full_name", "")
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error getting user workspaces: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get workspaces")
+
+@app.get("/dashboard/{team_id}", response_class=HTMLResponse)
+async def workspace_dashboard(request: Request, team_id: str):
+    """Dashboard for specific workspace"""
+    if not supabase_client:
+        raise HTTPException(status_code=500, detail="Database not available")
+    
+    try:
+        # Get tenant data from Supabase
+        response = await supabase_client.get(
+            "/rest/v1/tenants",
+            params={"team_id": f"eq.{team_id}", "active": "eq.true"}
+        )
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        
+        tenants = response.json()
+        if not tenants:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        
+        tenant = tenants[0]
+        
+        # Get installation events for scopes
+        events_response = await supabase_client.get(
+            "/rest/v1/installation_events",
+            params={"team_id": f"eq.{team_id}", "event_type": "eq.app_installed", "order": "created_at.desc", "limit": "1"}
+        )
+        
+        scopes = []
+        if events_response.status_code == 200:
+            events = events_response.json()
+            if events and events[0].get("metadata", {}).get("scopes"):
+                scopes = events[0]["metadata"]["scopes"]
+        
+        # Prepare dashboard data
+        dashboard_data = {
+            "request": request,
+            "team_id": tenant["team_id"],
+            "team_name": tenant["team_name"],
+            "bot_user_id": tenant["bot_user_id"],
+            "installer_name": tenant["installer_name"],
+            "plan": "Free",  # Default plan
+            "installation_date": tenant["created_at"][:10] if tenant.get("created_at") else "Unknown",
+            "scopes": scopes
+        }
+        
+        return templates.TemplateResponse("dashboard.html", dashboard_data)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}")
+        raise HTTPException(status_code=500, detail="Error loading dashboard")
 
 @app.get("/slack/install")
 async def slack_install():
@@ -309,10 +480,10 @@ async def slack_oauth_callback(
             storage_success = await store_installation(installation_data)
             
             if storage_success:
-                logger.info(f"✅ Successfully installed and stored EnableBot for team {team_name} ({team_id})")
+                logger.info(f"✅ Successfully installed and stored EnableOps for team {team_name} ({team_id})")
                 storage_status = "✅ Installation data securely stored in database"
             else:
-                logger.warning(f"⚠️ EnableBot installed for team {team_name} but failed to store in database")
+                logger.warning(f"⚠️ EnableOps installed for team {team_name} but failed to store in database")
                 storage_status = "⚠️ Installation successful but data storage failed"
             
             # Get the Slack workspace URL for redirect
@@ -324,7 +495,7 @@ async def slack_oauth_callback(
             return HTMLResponse(f"""
             <html>
                 <head>
-                    <title>EnableBot Installation Successful</title>
+                    <title>EnableOps Installation Successful</title>
                     <script>
                         // Auto-redirect to Slack after 3 seconds
                         setTimeout(function() {{
@@ -337,8 +508,8 @@ async def slack_oauth_callback(
                     </script>
                 </head>
                 <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-                    <h1>🎉 EnableBot Installation Successful!</h1>
-                    <p><strong>{team_name}</strong> workspace is now connected to EnableBot.</p>
+                    <h1>🎉 EnableOps Installation Successful!</h1>
+                    <p><strong>{team_name}</strong> workspace is now connected to EnableOps.</p>
                     <p>Bot User ID: <code>{bot_user_id}</code></p>
                     <p>{storage_status}</p>
                     
@@ -382,7 +553,7 @@ async def slack_oauth_callback(
         logger.error(f"OAuth callback error: {e}")
         return HTMLResponse(f"""
         <html>
-            <head><title>EnableBot Installation Error</title></head>
+            <head><title>EnableOps Installation Error</title></head>
             <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
                 <h1>❌ Installation Error</h1>
                 <p>There was an error completing the installation.</p>
@@ -398,7 +569,7 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "service": "EnableBot Web Interface",
+        "service": "EnableOps Web Interface",
         "version": "3.0.0"
     }
 
@@ -407,7 +578,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     host = os.getenv("HOST", "0.0.0.0")
     
-    logger.info(f"Starting EnableBot Web Interface on {host}:{port}")
+    logger.info(f"Starting EnableOps Web Interface on {host}:{port}")
     
     uvicorn.run(
         "enablebot.web.main:app",

@@ -1,19 +1,52 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EnableBot - Slack AI Assistant</title>
+    <title>EnableOps - Slack AI Assistant</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
 </head>
+
 <body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen">
+    <!-- Loading Overlay -->
+    <div id="loadingOverlay" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div class="bg-white rounded-lg p-6 text-center">
+            <i class="fas fa-spinner fa-spin text-3xl text-indigo-600 mb-4"></i>
+            <p class="text-gray-700">Checking authentication...</p>
+        </div>
+    </div>
+
+    <!-- User Info Bar -->
+    <div id="userBar" class="hidden bg-white shadow-sm border-b">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-12 items-center">
+                <div class="flex items-center">
+                    <span class="text-sm text-gray-600">Welcome back, <span id="userName"
+                            class="font-medium"></span></span>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <a href="/dashboard" class="text-sm text-indigo-600 hover:text-indigo-500">
+                        <i class="fas fa-tachometer-alt mr-1"></i>
+                        Dashboard
+                    </a>
+                    <button onclick="signOut()" class="text-sm text-gray-600 hover:text-gray-800">
+                        <i class="fas fa-sign-out-alt mr-1"></i>
+                        Sign Out
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div class="container mx-auto px-4 py-8">
         <!-- Header -->
         <header class="text-center mb-12">
             <div class="flex items-center justify-center mb-6">
-                <i class="fas fa-robot text-4xl text-indigo-600 mr-3"></i>
-                <h1 class="text-4xl font-bold text-gray-800">EnableBot</h1>
+                <div class="text-4xl mr-3">🔧</div>
+                <h1 class="text-4xl font-bold text-gray-800">EnableOps</h1>
             </div>
             <p class="text-xl text-gray-600 max-w-2xl mx-auto">
                 Your intelligent Slack AI assistant for workplace productivity and knowledge management
@@ -32,7 +65,8 @@
                 <div class="bg-white rounded-lg shadow-lg p-6 text-center">
                     <i class="fas fa-shield-alt text-3xl text-green-600 mb-4"></i>
                     <h3 class="text-xl font-semibold mb-2">Secure & Private</h3>
-                    <p class="text-gray-600">Enterprise-grade security with encrypted token storage and audit logging</p>
+                    <p class="text-gray-600">Enterprise-grade security with encrypted token storage and audit logging
+                    </p>
                 </div>
                 <div class="bg-white rounded-lg shadow-lg p-6 text-center">
                     <i class="fas fa-users text-3xl text-blue-600 mb-4"></i>
@@ -43,15 +77,15 @@
 
             <!-- Installation Section -->
             <div class="bg-white rounded-lg shadow-xl p-8 text-center">
-                <h2 class="text-3xl font-bold text-gray-800 mb-6">Get Started with EnableBot</h2>
+                <h2 class="text-3xl font-bold text-gray-800 mb-6">Get Started with EnableOps</h2>
                 <p class="text-lg text-gray-600 mb-8">
-                    Install EnableBot to your Slack workspace and start getting AI-powered assistance for your team
+                    Install EnableOps to your Slack workspace and start getting AI-powered assistance for your team
                 </p>
-                
+
                 <!-- Slack Install Button -->
                 <div class="mb-8">
-                    <a href="/slack/install" 
-                       class="inline-flex items-center px-8 py-4 bg-slack-green hover:bg-green-600 text-white font-semibold rounded-lg shadow-lg transition-colors duration-200 text-lg">
+                    <a href="/slack/install"
+                        class="inline-flex items-center px-8 py-4 bg-slack-green hover:bg-green-600 text-white font-semibold rounded-lg shadow-lg transition-colors duration-200 text-lg">
                         <i class="fab fa-slack text-2xl mr-3"></i>
                         Add to Slack
                     </a>
@@ -67,7 +101,8 @@
                             </div>
                             <div>
                                 <h4 class="font-semibold">Install to Slack</h4>
-                                <p class="text-sm text-gray-600">Click "Add to Slack" and authorize EnableBot for your workspace</p>
+                                <p class="text-sm text-gray-600">Click "Add to Slack" and authorize EnableOps for your
+                                    workspace</p>
                             </div>
                         </div>
                         <div class="flex items-start">
@@ -76,7 +111,8 @@
                             </div>
                             <div>
                                 <h4 class="font-semibold">Configure Settings</h4>
-                                <p class="text-sm text-gray-600">Set up your team preferences and upload knowledge documents</p>
+                                <p class="text-sm text-gray-600">Set up your team preferences and upload knowledge
+                                    documents</p>
                             </div>
                         </div>
                         <div class="flex items-start">
@@ -85,7 +121,8 @@
                             </div>
                             <div>
                                 <h4 class="font-semibold">Start Chatting</h4>
-                                <p class="text-sm text-gray-600">Message @EnableBot in Slack to get AI-powered assistance</p>
+                                <p class="text-sm text-gray-600">Message @EnableOps in Slack to get AI-powered
+                                    assistance</p>
                             </div>
                         </div>
                     </div>
@@ -106,9 +143,81 @@
         .bg-slack-green {
             background-color: #4A154B;
         }
+
         .bg-slack-green:hover {
             background-color: #611f69;
         }
     </style>
+
+    <script>
+        // Initialize Supabase
+        const supabaseUrl = '{{ supabase_url }}';
+        const supabaseKey = '{{ supabase_anon_key }}';
+        const supabase = window.supabase.createClient(supabaseUrl, supabaseKey);
+
+        let currentUser = null;
+
+        // Check authentication on page load
+        document.addEventListener('DOMContentLoaded', async function () {
+            await checkAuth();
+        });
+
+        async function checkAuth() {
+            try {
+                const { data: { user }, error } = await supabase.auth.getUser();
+
+                if (error || !user) {
+                    // Redirect to landing page if not authenticated
+                    window.location.href = '/';
+                    return;
+                }
+
+                currentUser = user;
+                showUserInfo(user);
+                hideLoading();
+
+            } catch (error) {
+                console.error('Auth check error:', error);
+                window.location.href = '/';
+            }
+        }
+
+        function showUserInfo(user) {
+            const userBar = document.getElementById('userBar');
+            const userName = document.getElementById('userName');
+
+            // Extract name from user metadata or email
+            const displayName = user.user_metadata?.full_name ||
+                user.email?.split('@')[0] ||
+                'User';
+
+            userName.textContent = displayName;
+            userBar.classList.remove('hidden');
+        }
+
+        function hideLoading() {
+            document.getElementById('loadingOverlay').classList.add('hidden');
+        }
+
+        async function signOut() {
+            try {
+                const { error } = await supabase.auth.signOut();
+                if (error) throw error;
+
+                window.location.href = '/';
+            } catch (error) {
+                console.error('Sign out error:', error);
+                alert('Error signing out. Please try again.');
+            }
+        }
+
+        // Handle auth state changes
+        supabase.auth.onAuthStateChange((event, session) => {
+            if (event === 'SIGNED_OUT') {
+                window.location.href = '/';
+            }
+        });
+    </script>
 </body>
+
 </html>
