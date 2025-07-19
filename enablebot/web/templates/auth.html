@@ -245,7 +245,33 @@
         // Initialize Supabase
         const supabaseUrl = '{{ supabase_url }}';
         const supabaseKey = '{{ supabase_anon_key }}';
-        const supabase = window.supabase.createClient(supabaseUrl, supabaseKey);
+        let supabase = null;
+
+        // Initialize Supabase when the library is loaded
+        function initializeSupabase() {
+            if (window.supabase && supabaseUrl && supabaseKey) {
+                supabase = window.supabase.createClient(supabaseUrl, supabaseKey);
+                console.log('Supabase initialized successfully');
+                return true;
+            }
+            return false;
+        }
+
+        // Wait for Supabase library to load
+        function waitForSupabase() {
+            return new Promise((resolve) => {
+                if (initializeSupabase()) {
+                    resolve();
+                } else {
+                    const checkInterval = setInterval(() => {
+                        if (initializeSupabase()) {
+                            clearInterval(checkInterval);
+                            resolve();
+                        }
+                    }, 100);
+                }
+            });
+        }
 
         // Tab switching
         function switchTab(tab) {
@@ -305,6 +331,9 @@
             showLoading();
 
             try {
+                // Wait for Supabase to be initialized
+                await waitForSupabase();
+
                 const { data, error } = await supabase.auth.signInWithPassword({
                     email: email,
                     password: password,
@@ -337,6 +366,9 @@
             showLoading();
 
             try {
+                // Wait for Supabase to be initialized
+                await waitForSupabase();
+
                 const { data, error } = await supabase.auth.signUp({
                     email: email,
                     password: password,
@@ -386,7 +418,7 @@
                 if (response.ok) {
                     window.location.href = `/dashboard/${teamId}`;
                 } else if (response.status === 404) {
-                    alert('Workspace not found. Please check your Workspace ID or install EnableBot first.');
+                    alert('Workspace not found. Please check your Workspace ID or install EnableOps first.');
                 } else {
                     alert('Error accessing workspace. Please try again.');
                 }
@@ -402,20 +434,35 @@
 
         // Check if user is already signed in
         document.addEventListener('DOMContentLoaded', async function () {
-            const { data: { user } } = await supabase.auth.getUser();
+            try {
+                // Wait for Supabase to be initialized
+                await waitForSupabase();
+                
+                const { data: { user } } = await supabase.auth.getUser();
 
-            if (user) {
-                // User is already signed in, redirect to home page
-                window.location.href = '/home';
+                if (user) {
+                    // User is already signed in, redirect to home page
+                    window.location.href = '/home';
+                }
+            } catch (error) {
+                console.error('Error checking auth state:', error);
             }
         });
 
-        // Handle auth state changes
-        supabase.auth.onAuthStateChange((event, session) => {
-            if (event === 'SIGNED_IN') {
-                window.location.href = '/home';
-            }
-        });
+        // Initialize auth state change handler after Supabase is ready
+        async function initAuthStateHandler() {
+            await waitForSupabase();
+            
+            // Handle auth state changes
+            supabase.auth.onAuthStateChange((event, session) => {
+                if (event === 'SIGNED_IN') {
+                    window.location.href = '/home';
+                }
+            });
+        }
+
+        // Initialize the auth state handler
+        initAuthStateHandler();
     </script>
 </body>
 
