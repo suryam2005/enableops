@@ -6,10 +6,11 @@ Handles Slack OAuth, dashboard, and installation flow
 import os
 import logging
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Request, Query, Depends, Header
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Query, Depends, Header, Cookie
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.session import SessionMiddleware
 import uvicorn
 import httpx
 import asyncpg
@@ -103,6 +104,12 @@ async def store_installation(installation_data: Dict[str, Any]) -> bool:
             "active": True
         }
         
+        # Add Supabase user linking if available
+        if installation_data.get("supabase_user_id"):
+            tenant_data["supabase_user_id"] = installation_data["supabase_user_id"]
+        if installation_data.get("installer_email"):
+            tenant_data["installer_email"] = installation_data["installer_email"]
+        
         # Store tenant data using Supabase REST API (upsert)
         # First try to update existing record
         update_response = await supabase_client.patch(
@@ -162,6 +169,9 @@ app = FastAPI(
     description="Slack OAuth and Dashboard for EnableOps AI Assistant",
     version="3.0.0"
 )
+
+# Add session middleware for user tracking
+app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", "your-secret-key-change-in-production"))
 
 # Add CORS middleware for Supabase Auth
 app.add_middleware(
@@ -228,13 +238,13 @@ async def verify_supabase_token(authorization: str = Header(None)):
         logger.error(f"Token verification error: {e}")
         raise HTTPException(status_code=401, detail="Invalid token")
 
-async def get_user_workspaces(user_email: str):
-    """Get workspaces associated with user email"""
+async def get_user_workspaces(user_email: str, user_id: str = None):
+    """Get workspaces associated with user email and Supabase user ID"""
     if not supabase_client:
         return []
     
     try:
-        # Query tenants where installer email matches or user has access
+        # Query tenants where user has access (by email or Supabase user ID)
         response = await supabase_client.get(
             "/rest/v1/tenants",
             params={"active": "eq.true"}
@@ -242,16 +252,42 @@ async def get_user_workspaces(user_email: str):
         
         if response.status_code == 200:
             tenants = response.json()
-            # Filter by user email or other criteria
             user_workspaces = []
+            
             for tenant in tenants:
-                # Add logic to check if user has access to this workspace
-                # For now, return all active workspaces
-                user_workspaces.append({
-                    "team_id": tenant["team_id"],
-                    "team_name": tenant["team_name"],
-                    "role": "admin" if tenant.get("installed_by") == user_email else "member"
-                })
+                # Check if user has access to this workspace
+                has_access = False
+                role = "member"
+                
+                # Check by Supabase user ID (primary method)
+                if user_id and tenant.get("supabase_user_id") == user_id:
+                    has_access = True
+                    role = "admin"  # User who installed gets admin role
+                
+                # Check by email (fallback method)
+                elif user_email and tenant.get("installer_email") == user_email:
+                    has_access = True
+                    role = "admin"
+                
+                # Check by installer name matching email prefix (additional fallback)
+                elif user_email and tenant.get("installer_name"):
+                    email_prefix = user_email.split('@')[0].lower()
+                    installer_name_lower = tenant.get("installer_name", "").lower()
+                    if email_prefix in installer_name_lower:
+                        has_access = True
+                        role = "member"
+                
+                if has_access:
+                    user_workspaces.append({
+                        "team_id": tenant["team_id"],
+                        "team_name": tenant["team_name"],
+                        "role": role,
+                        "installation_date": tenant.get("created_at", "Unknown"),
+                        "installer_name": tenant.get("installer_name", "Unknown"),
+                        "bot_user_id": tenant.get("bot_user_id", "")
+                    })
+            
+            logger.info(f"✅ Found {len(user_workspaces)} workspaces for user {user_email}")
             return user_workspaces
         
         return []
@@ -319,14 +355,16 @@ async def get_user_workspaces_api(user: dict = Depends(verify_supabase_token)):
     """API endpoint to get user's workspaces"""
     try:
         user_email = user.get("email", "")
-        workspaces = await get_user_workspaces(user_email)
+        user_id = user.get("id", "")
+        workspaces = await get_user_workspaces(user_email, user_id)
         
         return JSONResponse({
             "success": True,
             "workspaces": workspaces,
             "user": {
                 "email": user_email,
-                "name": user.get("user_metadata", {}).get("full_name", "")
+                "name": user.get("user_metadata", {}).get("full_name", ""),
+                "id": user_id
             }
         })
     except Exception as e:
@@ -387,10 +425,43 @@ async def workspace_dashboard(request: Request, team_id: str):
         logger.error(f"Dashboard error: {e}")
         raise HTTPException(status_code=500, detail="Error loading dashboard")
 
+@app.post("/slack/install")
+async def slack_install_post(request: Request):
+    """Handle Slack install with user session data"""
+    slack_client_id = os.getenv("SLACK_CLIENT_ID", "")
+    if not slack_client_id:
+        raise HTTPException(status_code=500, detail="Slack Client ID not configured")
+    
+    # Get form data
+    form_data = await request.form()
+    user_data_str = form_data.get("user_data")
+    
+    if user_data_str:
+        try:
+            import json
+            user_data = json.loads(user_data_str)
+            
+            # Store user info in session for later use in callback
+            request.session["supabase_user_id"] = user_data.get("user_id")
+            request.session["supabase_user_email"] = user_data.get("email")
+            request.session["supabase_user_name"] = user_data.get("full_name")
+            request.session["supabase_access_token"] = user_data.get("access_token")
+            
+            logger.info(f"✅ Stored Supabase user session for {user_data.get('email')} during Slack install")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not parse user data: {e}")
+    
+    # Generate state parameter for OAuth security
+    import secrets
+    state = secrets.token_urlsafe(32)
+    request.session["oauth_state"] = state
+    
+    install_url = f"https://slack.com/oauth/v2/authorize?client_id={slack_client_id}&scope=chat:write,im:history,im:read,im:write,team:read,users:read&user_scope=&state={state}"
+    return RedirectResponse(url=install_url)
+
 @app.get("/slack/install")
-async def slack_install():
-    """Redirect to Slack OAuth"""
-    # For now, redirect to Slack app installation page
+async def slack_install_get():
+    """Fallback GET endpoint for direct Slack install (without user session)"""
     slack_client_id = os.getenv("SLACK_CLIENT_ID", "")
     if not slack_client_id:
         raise HTTPException(status_code=500, detail="Slack Client ID not configured")
@@ -446,9 +517,23 @@ async def slack_oauth_callback(
             installer_access_token = oauth_response.get("authed_user", {}).get("access_token")
             scopes = oauth_response.get("scope", "").split(",")
             
-            # Get installer's name from Slack API
+            # Check if we have Supabase user session data
+            supabase_user_id = request.session.get("supabase_user_id")
+            supabase_user_email = request.session.get("supabase_user_email")
+            supabase_user_name = request.session.get("supabase_user_name")
+            
+            # Get installer's name - prioritize Supabase user data, then Slack API
             installer_name = "Unknown User"
-            if installer_access_token and installer_user_id != "unknown":
+            installer_email = None
+            
+            if supabase_user_name and supabase_user_email:
+                # Use Supabase user data if available
+                installer_name = supabase_user_name
+                installer_email = supabase_user_email
+                installer_user_id = supabase_user_id or installer_user_id
+                logger.info(f"✅ Using Supabase user data: {installer_name} ({installer_email})")
+            elif installer_access_token and installer_user_id != "unknown":
+                # Fallback to Slack API
                 try:
                     async with httpx.AsyncClient() as client:
                         user_response = await client.get(
@@ -460,7 +545,8 @@ async def slack_oauth_callback(
                         if user_data.get("ok") and user_data.get("user"):
                             user_profile = user_data["user"].get("profile", {})
                             installer_name = user_profile.get("display_name") or user_profile.get("real_name") or user_data["user"].get("name", "Unknown User")
-                            logger.info(f"✅ Retrieved installer name: {installer_name}")
+                            installer_email = user_profile.get("email")
+                            logger.info(f"✅ Retrieved installer name from Slack: {installer_name}")
                 except Exception as e:
                     logger.warning(f"⚠️ Could not retrieve installer name: {e}")
             
@@ -472,6 +558,8 @@ async def slack_oauth_callback(
                 "bot_user_id": bot_user_id,
                 "installer_user_id": installer_user_id,
                 "installer_name": installer_name,
+                "installer_email": installer_email,
+                "supabase_user_id": supabase_user_id,
                 "scopes": scopes,
                 "installation_source": "web_oauth"
             }

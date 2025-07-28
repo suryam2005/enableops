@@ -84,11 +84,11 @@
 
                 <!-- Slack Install Button -->
                 <div class="mb-8">
-                    <a href="/slack/install"
-                        class="inline-flex items-center px-8 py-4 bg-slack-green hover:bg-green-600 text-white font-semibold rounded-lg shadow-lg transition-colors duration-200 text-lg">
+                    <button onclick="installToSlack()"
+                        class="inline-flex items-center px-8 py-4 bg-slack-green hover:bg-green-600 text-white font-semibold rounded-lg shadow-lg transition-colors duration-200 text-lg cursor-pointer">
                         <i class="fab fa-slack text-2xl mr-3"></i>
                         Add to Slack
-                    </a>
+                    </button>
                 </div>
 
                 <!-- How it works -->
@@ -208,6 +208,48 @@
             } catch (error) {
                 console.error('Sign out error:', error);
                 alert('Error signing out. Please try again.');
+            }
+        }
+
+        // Install to Slack with user session tracking
+        async function installToSlack() {
+            try {
+                if (!currentUser) {
+                    alert('Please sign in first to install EnableOps to your Slack workspace.');
+                    return;
+                }
+
+                // Get current session
+                const { data: { session } } = await supabase.auth.getSession();
+                if (!session) {
+                    alert('Session expired. Please sign in again.');
+                    window.location.href = '/auth';
+                    return;
+                }
+
+                // Create a form to POST user data to the install endpoint
+                const form = document.createElement('form');
+                form.method = 'POST';
+                form.action = '/slack/install';
+                
+                // Add user session data
+                const userDataInput = document.createElement('input');
+                userDataInput.type = 'hidden';
+                userDataInput.name = 'user_data';
+                userDataInput.value = JSON.stringify({
+                    user_id: currentUser.id,
+                    email: currentUser.email,
+                    full_name: currentUser.user_metadata?.full_name || currentUser.email?.split('@')[0] || 'User',
+                    access_token: session.access_token
+                });
+                
+                form.appendChild(userDataInput);
+                document.body.appendChild(form);
+                form.submit();
+
+            } catch (error) {
+                console.error('Error during Slack install:', error);
+                alert('Error starting installation. Please try again.');
             }
         }
 
