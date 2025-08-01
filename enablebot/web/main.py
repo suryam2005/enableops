@@ -172,6 +172,53 @@ async def slack_install_get():
     install_url = f"https://slack.com/oauth/v2/authorize?client_id={slack_client_id}&scope=chat:write,im:history,im:read,im:write,team:read,users:read&user_scope="
     return RedirectResponse(url=install_url)
 
+@app.post("/slack/install")
+async def slack_install_post(request: Request):
+    """Handle Slack install with user session data (simplified)"""
+    slack_client_id = os.getenv("SLACK_CLIENT_ID", "")
+    if not slack_client_id:
+        raise HTTPException(status_code=500, detail="Slack Client ID not configured")
+    
+    try:
+        # Get form data (user session info from frontend)
+        form_data = await request.form()
+        user_data_str = form_data.get("user_data")
+        
+        if user_data_str:
+            import json
+            user_data = json.loads(user_data_str)
+            logger.info(f"✅ Received user data for Slack install: {user_data.get('email', 'unknown')}")
+            
+            # Store user info in session for later use (when we implement full OAuth)
+            request.session["pending_install_user"] = {
+                "user_id": user_data.get("user_id"),
+                "email": user_data.get("email"),
+                "full_name": user_data.get("full_name")
+            }
+        
+        # Generate state parameter for OAuth security
+        import secrets
+        state = secrets.token_urlsafe(32)
+        request.session["oauth_state"] = state
+        
+        # Redirect to Slack OAuth with state
+        install_url = f"https://slack.com/oauth/v2/authorize?client_id={slack_client_id}&scope=chat:write,im:history,im:read,im:write,team:read,users:read&user_scope=&state={state}"
+        return RedirectResponse(url=install_url)
+        
+    except Exception as e:
+        logger.error(f"Error in Slack install POST: {e}")
+        return HTMLResponse(f"""
+        <html>
+            <head><title>EnableOps Installation Error</title></head>
+            <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                <h1>❌ Installation Error</h1>
+                <p>There was an error starting the Slack installation.</p>
+                <p>Error: {str(e)}</p>
+                <p><a href="/home" style="color: #4A154B; text-decoration: none;">← Back to Home</a></p>
+            </body>
+        </html>
+        """)
+
 @app.get("/slack/oauth/callback")
 async def slack_oauth_callback(
     request: Request,
