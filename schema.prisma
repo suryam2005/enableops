@@ -1,0 +1,130 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider             = "prisma-client-py"
+  recursive_type_depth = 5
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// User profiles linked to Supabase Auth
+model UserProfile {
+  id              String   @id @default(cuid())
+  supabaseUserId  String   @unique @map("supabase_user_id")
+  email           String   @unique
+  fullName        String?  @map("full_name")
+  avatarUrl       String?  @map("avatar_url")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenants         Tenant[]
+  installationEvents InstallationEvent[]
+
+  @@map("user_profiles")
+}
+
+// Slack workspace tenants
+model Tenant {
+  id                String       @id @default(cuid())
+  teamId            String       @unique @map("team_id")
+  teamName          String       @map("team_name")
+  encryptedBotToken String       @map("encrypted_bot_token")
+  encryptionKeyId   String?      @map("encryption_key_id")
+  botUserId         String       @map("bot_user_id")
+  installedBy       String       @map("installed_by") // Slack user ID
+  installerName     String       @map("installer_name")
+  installerEmail    String?      @map("installer_email")
+  supabaseUserId    String?      @map("supabase_user_id")
+  plan              PlanType     @default(FREE)
+  status            TenantStatus @default(ACTIVE)
+  settings          Json         @default("{}")
+  createdAt         DateTime     @default(now()) @map("created_at")
+  updatedAt         DateTime     @updatedAt @map("updated_at")
+  lastActive        DateTime?    @map("last_active")
+
+  // Relations
+  userProfile       UserProfile? @relation(fields: [supabaseUserId], references: [supabaseUserId])
+  installationEvents InstallationEvent[]
+  knowledgeBase     KnowledgeBase[]
+
+  @@map("tenants")
+}
+
+// Installation events and audit log
+model InstallationEvent {
+  id            String    @id @default(cuid())
+  teamId        String    @map("team_id")
+  eventType     EventType @map("event_type")
+  eventData     Json      @map("event_data")
+  installerId   String    @map("installer_id") // Slack user ID
+  installerName String    @map("installer_name")
+  scopes        String[]
+  metadata      Json      @default("{}")
+  supabaseUserId String?  @map("supabase_user_id")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  tenant        Tenant      @relation(fields: [teamId], references: [teamId])
+  userProfile   UserProfile? @relation(fields: [supabaseUserId], references: [supabaseUserId])
+
+  @@map("installation_events")
+}
+
+// Knowledge base for each tenant
+model KnowledgeBase {
+  id          String   @id @default(cuid())
+  teamId      String   @map("team_id")
+  title       String
+  content     String
+  contentType String   @map("content_type")
+  source      String?
+  metadata    Json     @default("{}")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tenant      Tenant   @relation(fields: [teamId], references: [teamId])
+
+  @@map("knowledge_base")
+}
+
+// Encryption keys for token security
+model EncryptionKey {
+  id        String   @id @default(cuid())
+  keyId     String   @unique @map("key_id")
+  keyData   String   @map("key_data") // Encrypted key
+  algorithm String   @default("AES-256-GCM")
+  createdAt DateTime @default(now()) @map("created_at")
+  isActive  Boolean  @default(true) @map("is_active")
+
+  @@map("encryption_keys")
+}
+
+// Enums
+enum PlanType {
+  FREE
+  PRO
+  ENTERPRISE
+}
+
+enum TenantStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum EventType {
+  APP_INSTALLED
+  APP_UNINSTALLED
+  TOKEN_REFRESHED
+  SETTINGS_UPDATED
+  USER_ADDED
+  USER_REMOVED
+}

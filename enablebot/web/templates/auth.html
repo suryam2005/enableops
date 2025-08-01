@@ -437,7 +437,7 @@
             try {
                 // Wait for Supabase to be initialized
                 await waitForSupabase();
-                
+
                 const { data: { user } } = await supabase.auth.getUser();
 
                 if (user) {
@@ -452,7 +452,7 @@
         // Initialize auth state change handler after Supabase is ready
         async function initAuthStateHandler() {
             await waitForSupabase();
-            
+
             // Handle auth state changes
             supabase.auth.onAuthStateChange((event, session) => {
                 if (event === 'SIGNED_IN') {

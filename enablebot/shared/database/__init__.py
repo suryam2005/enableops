@@ -1,3 +1,1 @@
-"""
-Database layer for EnableBot
-"""
+# Database module

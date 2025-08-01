@@ -1,3 +1,1 @@
-"""
-Encryption layer for EnableBot
-"""
+# Encryption module

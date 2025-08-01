@@ -1,21 +1,31 @@
 """
 EnableOps Web Interface
-Handles Slack OAuth, dashboard, and installation flow
+Handles Slack OAuth, dashboard, and installation flow using Prisma ORM and Supabase Auth
 """
 
 import os
 import logging
+import json
+import secrets
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Request, Query, Depends, Header, Cookie
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
+from typing import Optional, Dict, Any, List
+
+from fastapi import FastAPI, HTTPException, Request, Query, Depends, Header
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.session import SessionMiddleware
 import uvicorn
-import httpx
-import asyncpg
-import json
-from typing import Optional, Dict, Any
+
+# Import our new services
+from enablebot.shared.database.prisma_client import init_prisma, close_prisma, get_prisma
+from enablebot.shared.database.models import (
+    UserProfileService, TenantService, InstallationEventService, 
+    KnowledgeBaseService, EncryptionKeyService
+)
+from enablebot.shared.auth.supabase_auth import auth_service
+from enablebot.shared.encryption.encryption import encrypt_slack_token, initialize_encryption
+from prisma.enums import PlanType, TenantStatus, EventType
 
 # Configure logging
 logging.basicConfig(
@@ -24,139 +34,84 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Supabase client
-supabase_client = None
 
-async def init_supabase():
-    """Initialize Supabase REST API client"""
-    global supabase_client
-    try:
-        supabase_url = os.getenv("SUPABASE_URL")
-        supabase_service_key = os.getenv("SUPABASE_SERVICE_KEY")
-        
-        if not supabase_url or not supabase_service_key:
-            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
-        
-        # Create HTTP client for Supabase REST API
-        supabase_client = httpx.AsyncClient(
-            base_url=supabase_url,
-            headers={
-                "apikey": supabase_service_key,
-                "Authorization": f"Bearer {supabase_service_key}",
-                "Content-Type": "application/json",
-                "Prefer": "return=minimal"
-            },
-            timeout=30.0
-        )
-        
-        # Test connection by making a simple request
-        response = await supabase_client.get("/rest/v1/")
-        if response.status_code == 200:
-            logger.info("✅ Supabase REST API connection initialized")
-            return True
-        else:
-            logger.error(f"❌ Supabase connection test failed: {response.status_code}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize Supabase: {e}")
-        return False
-
-
-
-async def encrypt_token(token: str, tenant_id: str) -> tuple[str, str]:
-    """Simple token encryption (basic implementation)"""
-    import base64
-    import secrets
-    from cryptography.fernet import Fernet
-    
-    # Generate a key (in production, this should be managed properly)
-    key = Fernet.generate_key()
-    cipher_suite = Fernet(key)
-    
-    # Encrypt the token
-    encrypted_token = cipher_suite.encrypt(token.encode())
-    
-    # Return base64 encoded encrypted token and key
-    return base64.b64encode(encrypted_token).decode(), base64.b64encode(key).decode()
 
 async def store_installation(installation_data: Dict[str, Any]) -> bool:
-    """Store installation data in Supabase using REST API"""
-    if not supabase_client:
-        logger.error("Supabase client not initialized")
-        return False
-    
+    """Store installation data using Prisma ORM"""
     try:
+        # Initialize encryption if not already done
+        initialize_encryption()
+        
         # Encrypt the bot token
-        encrypted_token, encryption_key = await encrypt_token(
+        encrypted_token, encryption_key_id = await encrypt_slack_token(
             installation_data["bot_token"], 
             installation_data["team_id"]
         )
         
-        # Prepare tenant data for Supabase (matching existing schema)
-        tenant_data = {
-            "team_id": installation_data["team_id"],
-            "team_name": installation_data["team_name"],
-            "access_token": encrypted_token,  # Using access_token column instead of encrypted_bot_token
-            "bot_user_id": installation_data["bot_user_id"],
-            "installed_by": installation_data.get("installer_user_id", "unknown"),
-            "installer_name": installation_data.get("installer_name", "Unknown User"),
-            "active": True
-        }
-        
-        # Add Supabase user linking if available
-        if installation_data.get("supabase_user_id"):
-            tenant_data["supabase_user_id"] = installation_data["supabase_user_id"]
-        if installation_data.get("installer_email"):
-            tenant_data["installer_email"] = installation_data["installer_email"]
-        
-        # Store tenant data using Supabase REST API (upsert)
-        # First try to update existing record
-        update_response = await supabase_client.patch(
-            "/rest/v1/tenants",
-            json=tenant_data,
-            params={"team_id": f"eq.{installation_data['team_id']}"}
-        )
-        
-        if update_response.status_code in [200, 204]:
-            logger.info(f"✅ Updated existing tenant data for team {installation_data['team_id']}")
-        else:
-            # If update fails, try to insert new record
-            insert_response = await supabase_client.post(
-                "/rest/v1/tenants",
-                json=tenant_data
+        # Create or update user profile if Supabase user data is available
+        user_profile = None
+        if installation_data.get("supabase_user_id") and installation_data.get("installer_email"):
+            user_profile = await UserProfileService.create_or_update_user(
+                supabase_user_id=installation_data["supabase_user_id"],
+                email=installation_data["installer_email"],
+                full_name=installation_data.get("installer_name")
             )
-            
-            if insert_response.status_code not in [200, 201]:
-                logger.error(f"Failed to store tenant data: {insert_response.status_code} - {insert_response.text}")
-                return False
-            else:
-                logger.info(f"✅ Inserted new tenant data for team {installation_data['team_id']}")
+            logger.info(f"✅ Created/updated user profile for {installation_data['installer_email']}")
         
-        # Store installation event (matching existing schema)
-        event_data = {
-            "team_id": installation_data["team_id"],
-            "team_name": installation_data["team_name"],
-            "event_type": "app_installed",
-            "installed_by": installation_data.get("installer_user_id", "unknown"),
-            "installer_name": installation_data.get("installer_name", "Unknown User"),
-            "metadata": {
+        # Check if tenant already exists
+        existing_tenant = await TenantService.get_tenant_by_team_id(installation_data["team_id"])
+        
+        if existing_tenant:
+            # Update existing tenant
+            tenant = await TenantService.update_tenant(
+                team_id=installation_data["team_id"],
+                teamName=installation_data["team_name"],
+                encryptedBotToken=encrypted_token,
+                encryptionKeyId=encryption_key_id,
+                botUserId=installation_data["bot_user_id"],
+                installerName=installation_data.get("installer_name", "Unknown User"),
+                installerEmail=installation_data.get("installer_email"),
+                supabaseUserId=installation_data.get("supabase_user_id"),
+                status=TenantStatus.ACTIVE,
+                lastActive=datetime.now()
+            )
+            logger.info(f"✅ Updated existing tenant for team {installation_data['team_id']}")
+        else:
+            # Create new tenant
+            tenant = await TenantService.create_tenant(
+                team_id=installation_data["team_id"],
+                team_name=installation_data["team_name"],
+                encrypted_bot_token=encrypted_token,
+                encryption_key_id=encryption_key_id,
+                bot_user_id=installation_data["bot_user_id"],
+                installed_by=installation_data.get("installer_user_id", "unknown"),
+                installer_name=installation_data.get("installer_name", "Unknown User"),
+                installer_email=installation_data.get("installer_email"),
+                supabase_user_id=installation_data.get("supabase_user_id"),
+                plan=PlanType.FREE
+            )
+            logger.info(f"✅ Created new tenant for team {installation_data['team_id']}")
+        
+        # Create installation event
+        await InstallationEventService.create_event(
+            team_id=installation_data["team_id"],
+            event_type=EventType.APP_INSTALLED,
+            event_data={
+                "team_name": installation_data["team_name"],
                 "bot_user_id": installation_data["bot_user_id"],
-                "scopes": installation_data.get("scopes", []),
-                "installation_source": "web_oauth"
+                "installation_source": installation_data.get("installation_source", "web_oauth")
+            },
+            installer_id=installation_data.get("installer_user_id", "unknown"),
+            installer_name=installation_data.get("installer_name", "Unknown User"),
+            scopes=installation_data.get("scopes", []),
+            supabase_user_id=installation_data.get("supabase_user_id"),
+            metadata={
+                "oauth_timestamp": datetime.now().isoformat(),
+                "encryption_key_id": encryption_key_id
             }
-        }
-        
-        response = await supabase_client.post(
-            "/rest/v1/installation_events",
-            json=event_data
         )
         
-        if response.status_code not in [200, 201]:
-            logger.warning(f"Failed to store installation event: {response.status_code} - {response.text}")
-            # Don't fail the whole operation if event logging fails
-        
-        logger.info(f"✅ Stored installation data for team {installation_data['team_id']}")
+        logger.info(f"✅ Successfully stored installation data for team {installation_data['team_id']}")
         return True
         
     except Exception as e:
@@ -214,7 +169,7 @@ templates = Jinja2Templates(directory=templates_path)
 
 # Authentication helpers
 async def verify_supabase_token(authorization: str = Header(None)):
-    """Verify Supabase JWT token"""
+    """Verify Supabase JWT token using auth service"""
     if not authorization:
         raise HTTPException(status_code=401, detail="Authorization header missing")
     
@@ -222,75 +177,49 @@ async def verify_supabase_token(authorization: str = Header(None)):
         # Extract token from "Bearer <token>"
         token = authorization.split(" ")[1] if authorization.startswith("Bearer ") else authorization
         
-        # Verify token with Supabase
-        response = await supabase_client.get(
-            "/auth/v1/user",
-            headers={"Authorization": f"Bearer {token}"}
-        )
+        # Verify token with Supabase Auth service
+        user_data = await auth_service.verify_token(token)
         
-        if response.status_code != 200:
+        if not user_data:
             raise HTTPException(status_code=401, detail="Invalid token")
         
-        user_data = response.json()
         return user_data
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Token verification error: {e}")
         raise HTTPException(status_code=401, detail="Invalid token")
 
-async def get_user_workspaces(user_email: str, user_id: str = None):
-    """Get workspaces associated with user email and Supabase user ID"""
-    if not supabase_client:
-        return []
-    
+async def get_user_workspaces(user_email: str, user_id: str = None) -> List[Dict[str, Any]]:
+    """Get workspaces associated with user using Prisma"""
     try:
-        # Query tenants where user has access (by email or Supabase user ID)
-        response = await supabase_client.get(
-            "/rest/v1/tenants",
-            params={"active": "eq.true"}
-        )
+        if user_id:
+            # Get tenants by Supabase user ID (primary method)
+            tenants = await TenantService.get_user_tenants(user_id)
+        else:
+            # Fallback: get all active tenants and filter by email
+            all_tenants = await TenantService.get_active_tenants()
+            tenants = [
+                tenant for tenant in all_tenants 
+                if tenant.installerEmail == user_email or 
+                (user_email and tenant.installerName and user_email.split('@')[0].lower() in tenant.installerName.lower())
+            ]
         
-        if response.status_code == 200:
-            tenants = response.json()
-            user_workspaces = []
-            
-            for tenant in tenants:
-                # Check if user has access to this workspace
-                has_access = False
-                role = "member"
-                
-                # Check by Supabase user ID (primary method)
-                if user_id and tenant.get("supabase_user_id") == user_id:
-                    has_access = True
-                    role = "admin"  # User who installed gets admin role
-                
-                # Check by email (fallback method)
-                elif user_email and tenant.get("installer_email") == user_email:
-                    has_access = True
-                    role = "admin"
-                
-                # Check by installer name matching email prefix (additional fallback)
-                elif user_email and tenant.get("installer_name"):
-                    email_prefix = user_email.split('@')[0].lower()
-                    installer_name_lower = tenant.get("installer_name", "").lower()
-                    if email_prefix in installer_name_lower:
-                        has_access = True
-                        role = "member"
-                
-                if has_access:
-                    user_workspaces.append({
-                        "team_id": tenant["team_id"],
-                        "team_name": tenant["team_name"],
-                        "role": role,
-                        "installation_date": tenant.get("created_at", "Unknown"),
-                        "installer_name": tenant.get("installer_name", "Unknown"),
-                        "bot_user_id": tenant.get("bot_user_id", "")
-                    })
-            
-            logger.info(f"✅ Found {len(user_workspaces)} workspaces for user {user_email}")
-            return user_workspaces
+        # Convert to response format
+        user_workspaces = []
+        for tenant in tenants:
+            user_workspaces.append({
+                "team_id": tenant.teamId,
+                "team_name": tenant.teamName,
+                "role": "admin" if tenant.supabaseUserId == user_id else "member",
+                "installation_date": tenant.createdAt.strftime("%B %d, %Y") if tenant.createdAt else "Unknown",
+                "installer_name": tenant.installerName or "Unknown",
+                "bot_user_id": tenant.botUserId or ""
+            })
         
-        return []
+        logger.info(f"✅ Found {len(user_workspaces)} workspaces for user {user_email}")
+        return user_workspaces
         
     except Exception as e:
         logger.error(f"Error getting user workspaces: {e}")
@@ -301,11 +230,16 @@ async def startup_event():
     """Initialize web application"""
     logger.info("🚀 Starting EnableOps Web Application...")
     
-    # Initialize Supabase connection
-    if await init_supabase():
-        logger.info("✅ Supabase connection initialized")
+    # Initialize Prisma database connection
+    if await init_prisma():
+        logger.info("✅ Prisma database connection initialized")
     else:
-        logger.warning("⚠️ Supabase connection failed - continuing without database")
+        logger.error("❌ Prisma database connection failed")
+        raise RuntimeError("Database connection required")
+    
+    # Initialize encryption system
+    initialize_encryption()
+    logger.info("✅ Encryption system initialized")
     
     logger.info("🎉 EnableOps Web Application ready!")
 
@@ -313,6 +247,13 @@ async def startup_event():
 async def shutdown_event():
     """Clean up on shutdown"""
     logger.info("🛑 Shutting down EnableOps Web Application...")
+    
+    # Close Prisma connection
+    await close_prisma()
+    
+    # Close auth service
+    await auth_service.close()
+    
     logger.info("✅ Cleanup completed")
 
 @app.get("/", response_class=HTMLResponse)
@@ -373,47 +314,33 @@ async def get_user_workspaces_api(user: dict = Depends(verify_supabase_token)):
 
 @app.get("/dashboard/{team_id}", response_class=HTMLResponse)
 async def workspace_dashboard(request: Request, team_id: str):
-    """Dashboard for specific workspace"""
-    if not supabase_client:
-        raise HTTPException(status_code=500, detail="Database not available")
-    
+    """Dashboard for specific workspace using Prisma"""
     try:
-        # Get tenant data from Supabase
-        response = await supabase_client.get(
-            "/rest/v1/tenants",
-            params={"team_id": f"eq.{team_id}", "active": "eq.true"}
-        )
+        # Get tenant data using Prisma
+        tenant = await TenantService.get_tenant_by_team_id(team_id)
         
-        if response.status_code != 200:
+        if not tenant or tenant.status != TenantStatus.ACTIVE:
             raise HTTPException(status_code=404, detail="Workspace not found")
-        
-        tenants = response.json()
-        if not tenants:
-            raise HTTPException(status_code=404, detail="Workspace not found")
-        
-        tenant = tenants[0]
         
         # Get installation events for scopes
-        events_response = await supabase_client.get(
-            "/rest/v1/installation_events",
-            params={"team_id": f"eq.{team_id}", "event_type": "eq.app_installed", "order": "created_at.desc", "limit": "1"}
-        )
-        
+        events = await InstallationEventService.get_team_events(team_id)
         scopes = []
-        if events_response.status_code == 200:
-            events = events_response.json()
-            if events and events[0].get("metadata", {}).get("scopes"):
-                scopes = events[0]["metadata"]["scopes"]
+        
+        # Find the latest installation event
+        for event in events:
+            if event.eventType == EventType.APP_INSTALLED:
+                scopes = event.scopes
+                break
         
         # Prepare dashboard data
         dashboard_data = {
             "request": request,
-            "team_id": tenant["team_id"],
-            "team_name": tenant["team_name"],
-            "bot_user_id": tenant["bot_user_id"],
-            "installer_name": tenant["installer_name"],
-            "plan": "Free",  # Default plan
-            "installation_date": tenant["created_at"][:10] if tenant.get("created_at") else "Unknown",
+            "team_id": tenant.teamId,
+            "team_name": tenant.teamName,
+            "bot_user_id": tenant.botUserId,
+            "installer_name": tenant.installerName,
+            "plan": tenant.plan.value.title(),
+            "installation_date": tenant.createdAt.strftime("%B %d, %Y") if tenant.createdAt else "Unknown",
             "scopes": scopes
         }
         
