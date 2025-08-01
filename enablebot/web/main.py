@@ -172,6 +172,111 @@ async def slack_install_get():
     install_url = f"https://slack.com/oauth/v2/authorize?client_id={slack_client_id}&scope=chat:write,im:history,im:read,im:write,team:read,users:read&user_scope="
     return RedirectResponse(url=install_url)
 
+@app.get("/slack/oauth/callback")
+async def slack_oauth_callback(
+    request: Request,
+    code: str = Query(...),
+    state: str = Query(None),
+    error: str = Query(None)
+):
+    """Handle Slack OAuth callback (simplified)"""
+    if error:
+        logger.error(f"Slack OAuth error: {error}")
+        return HTMLResponse(f"""
+        <html>
+            <head><title>EnableOps Installation Error</title></head>
+            <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                <h1>❌ Installation Error</h1>
+                <p>There was an error during Slack installation: {error}</p>
+                <p><a href="/" style="color: #4A154B; text-decoration: none;">← Back to Home</a></p>
+            </body>
+        </html>
+        """)
+    
+    try:
+        # For now, show a success message
+        # Full OAuth implementation will be added with Prisma later
+        return HTMLResponse("""
+        <html>
+            <head>
+                <title>EnableOps Installation Successful</title>
+                <script>
+                    // Auto-redirect to home after 3 seconds
+                    setTimeout(function() {
+                        window.location.href = '/';
+                    }, 3000);
+                </script>
+            </head>
+            <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                <h1>🎉 EnableOps Installation Started!</h1>
+                <p>Your Slack workspace connection is being processed.</p>
+                
+                <div style="margin: 30px 0; padding: 20px; background: #e8f5e8; border-radius: 8px; border: 2px solid #4caf50;">
+                    <h3>✅ Installation Received</h3>
+                    <p>We've received your installation request. Full database integration will be available soon!</p>
+                    <p>Redirecting to home page in <span id="countdown">3</span> seconds...</p>
+                </div>
+                
+                <div style="margin: 30px 0; padding: 20px; background: #f0f8ff; border-radius: 8px;">
+                    <h3>Next Steps:</h3>
+                    <ol style="text-align: left; display: inline-block;">
+                        <li>Complete the full Prisma database setup</li>
+                        <li>Configure your Slack app credentials</li>
+                        <li>Test the complete installation flow</li>
+                    </ol>
+                </div>
+                
+                <p><a href="/" style="color: #4A154B; text-decoration: none;">← Back to Home</a></p>
+                
+                <script>
+                    // Countdown timer
+                    let countdown = 3;
+                    const countdownElement = document.getElementById('countdown');
+                    const timer = setInterval(function() {
+                        countdown--;
+                        countdownElement.textContent = countdown;
+                        if (countdown <= 0) {
+                            clearInterval(timer);
+                            countdownElement.textContent = 'now';
+                        }
+                    }, 1000);
+                </script>
+            </body>
+        </html>
+        """)
+        
+    except Exception as e:
+        logger.error(f"OAuth callback error: {e}")
+        return HTMLResponse(f"""
+        <html>
+            <head><title>EnableOps Installation Error</title></head>
+            <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                <h1>❌ Installation Error</h1>
+                <p>There was an error processing the installation.</p>
+                <p>Error: {str(e)}</p>
+                <p><a href="/" style="color: #4A154B; text-decoration: none;">← Try Again</a></p>
+            </body>
+        </html>
+        """)
+
+@app.post("/slack/events")
+async def slack_events(request: Request):
+    """Handle Slack events (simplified)"""
+    try:
+        body = await request.json()
+        
+        # Handle URL verification challenge
+        if body.get("type") == "url_verification":
+            return {"challenge": body.get("challenge")}
+        
+        # For now, just acknowledge other events
+        logger.info(f"Received Slack event: {body.get('type', 'unknown')}")
+        return {"status": "ok"}
+        
+    except Exception as e:
+        logger.error(f"Slack events error: {e}")
+        return {"status": "error", "message": str(e)}
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
