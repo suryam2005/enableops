@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Request, Query, Depends, Header
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.session import SessionMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 import uvicorn
 
 # Import our new services

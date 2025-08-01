@@ -90,10 +90,6 @@ If you encounter issues:
 
 Your keys should look like this format:
 
-```env
-SUPABASE_URL=https://abcdefghijklmnop.supabase.co
-SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFiY2RlZmdoaWprbG1ub3AiLCJyb2xlIjoic2VydmljZV9yb2xlIiwiaWF0IjoxNjc4OTEyMzQ1LCJleHAiOjE5OTQ0ODgzNDV9.example-signature-here
-SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFiY2RlZmdoaWprbG1ub3AiLCJyb2xlIjoiYW5vbiIsImlhdCI6MTY3ODkxMjM0NSwiZXhwIjoxOTk0NDg4MzQ1fQ.example-signature-here
-```
+
 
 Once you have the correct values, your EnableOps application will be ready to run! 🎉
