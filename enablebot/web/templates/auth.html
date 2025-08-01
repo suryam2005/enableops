@@ -344,7 +344,7 @@
                 }
 
                 // Redirect to home page
-                window.location.href = '/home';
+                window.location.href = window.location.origin + '/home';
             } catch (error) {
                 console.error('Sign in error:', error);
                 alert(error.message || 'Sign in failed. Please try again.');
@@ -442,7 +442,7 @@
 
                 if (user) {
                     // User is already signed in, redirect to home page
-                    window.location.href = '/home';
+                    window.location.href = window.location.origin + '/home';
                 }
             } catch (error) {
                 console.error('Error checking auth state:', error);
@@ -456,7 +456,8 @@
             // Handle auth state changes
             supabase.auth.onAuthStateChange((event, session) => {
                 if (event === 'SIGNED_IN') {
-                    window.location.href = '/home';
+                    // Redirect to home page on your domain
+                    window.location.href = window.location.origin + '/home';
                 }
             });
         }
