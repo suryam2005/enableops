@@ -1,5 +1,6 @@
 [build]
 builder = "nixpacks"
+buildCommand = "chmod +x scripts/build.sh && ./scripts/build.sh"
 
 [deploy]
 startCommand = "python -m uvicorn enablebot.web.main:app --host 0.0.0.0 --port $PORT"
