@@ -192,7 +192,7 @@ async def general_dashboard(request: Request):
     })
 
 async def store_installation_with_prisma(installation_data: Dict[str, Any]) -> bool:
-    """Store installation data using Prisma ORM"""
+    """Store installation data using Prisma ORM with fallback to direct SQL"""
     if not PRISMA_AVAILABLE:
         logger.warning("Prisma not available, skipping database storage")
         return False
@@ -207,67 +207,75 @@ async def store_installation_with_prisma(installation_data: Dict[str, Any]) -> b
             installation_data["team_id"]
         )
         
-        # Create or update user profile if Supabase user data is available
-        if installation_data.get("supabase_user_id") and installation_data.get("installer_email"):
-            await UserProfileService.create_or_update_user(
-                supabase_user_id=installation_data["supabase_user_id"],
-                email=installation_data["installer_email"],
-                full_name=installation_data.get("installer_name")
-            )
-            logger.info(f"✅ Created/updated user profile for {installation_data['installer_email']}")
-        
-        # Check if tenant already exists
-        existing_tenant = await TenantService.get_tenant_by_team_id(installation_data["team_id"])
-        
-        if existing_tenant:
-            # Update existing tenant
-            await TenantService.update_tenant(
+        # Try Prisma first, fallback to direct SQL if schema mismatch
+        try:
+            # Create or update user profile if Supabase user data is available
+            if installation_data.get("supabase_user_id") and installation_data.get("installer_email"):
+                await UserProfileService.create_or_update_user(
+                    supabase_user_id=installation_data["supabase_user_id"],
+                    email=installation_data["installer_email"],
+                    full_name=installation_data.get("installer_name")
+                )
+                logger.info(f"✅ Created/updated user profile for {installation_data['installer_email']}")
+            
+            # Check if tenant already exists
+            existing_tenant = await TenantService.get_tenant_by_team_id(installation_data["team_id"])
+            
+            if existing_tenant:
+                # Update existing tenant
+                await TenantService.update_tenant(
+                    team_id=installation_data["team_id"],
+                    teamName=installation_data["team_name"],
+                    encryptedBotToken=encrypted_token,
+                    encryptionKeyId=encryption_key_id,
+                    botUserId=installation_data["bot_user_id"],
+                    installerName=installation_data.get("installer_name", "Unknown User"),
+                    installerEmail=installation_data.get("installer_email"),
+                    supabaseUserId=installation_data.get("supabase_user_id"),
+                    status=TenantStatus.ACTIVE,
+                    lastActive=datetime.now()
+                )
+                logger.info(f"✅ Updated existing tenant for team {installation_data['team_id']}")
+            else:
+                # Create new tenant
+                tenant = await TenantService.create_tenant(
+                    team_id=installation_data["team_id"],
+                    team_name=installation_data["team_name"],
+                    encrypted_bot_token=encrypted_token,
+                    encryption_key_id=encryption_key_id,
+                    bot_user_id=installation_data["bot_user_id"],
+                    installed_by=installation_data.get("installer_user_id", "unknown"),
+                    installer_name=installation_data.get("installer_name", "Unknown User"),
+                    installer_email=installation_data.get("installer_email"),
+                    supabase_user_id=installation_data.get("supabase_user_id"),
+                    plan=PlanType.FREE
+                )
+                logger.info(f"✅ Created new tenant for team {installation_data['team_id']}")
+            
+            # Create installation event
+            await InstallationEventService.create_event(
                 team_id=installation_data["team_id"],
-                teamName=installation_data["team_name"],
-                encryptedBotToken=encrypted_token,
-                encryptionKeyId=encryption_key_id,
-                botUserId=installation_data["bot_user_id"],
-                installerName=installation_data.get("installer_name", "Unknown User"),
-                installerEmail=installation_data.get("installer_email"),
-                supabaseUserId=installation_data.get("supabase_user_id"),
-                status=TenantStatus.ACTIVE,
-                lastActive=datetime.now()
-            )
-            logger.info(f"✅ Updated existing tenant for team {installation_data['team_id']}")
-        else:
-            # Create new tenant
-            await TenantService.create_tenant(
-                team_id=installation_data["team_id"],
-                team_name=installation_data["team_name"],
-                encrypted_bot_token=encrypted_token,
-                encryption_key_id=encryption_key_id,
-                bot_user_id=installation_data["bot_user_id"],
-                installed_by=installation_data.get("installer_user_id", "unknown"),
+                event_type=EventType.APP_INSTALLED,
+                event_data={
+                    "team_name": installation_data["team_name"],
+                    "bot_user_id": installation_data["bot_user_id"],
+                    "installation_source": installation_data.get("installation_source", "web_oauth")
+                },
+                installer_id=installation_data.get("installer_user_id", "unknown"),
                 installer_name=installation_data.get("installer_name", "Unknown User"),
-                installer_email=installation_data.get("installer_email"),
+                scopes=installation_data.get("scopes", []),
                 supabase_user_id=installation_data.get("supabase_user_id"),
-                plan=PlanType.FREE
+                metadata={
+                    "oauth_timestamp": datetime.now().isoformat(),
+                    "encryption_key_id": encryption_key_id
+                }
             )
-            logger.info(f"✅ Created new tenant for team {installation_data['team_id']}")
-        
-        # Create installation event
-        await InstallationEventService.create_event(
-            team_id=installation_data["team_id"],
-            event_type=EventType.APP_INSTALLED,
-            event_data={
-                "team_name": installation_data["team_name"],
-                "bot_user_id": installation_data["bot_user_id"],
-                "installation_source": installation_data.get("installation_source", "web_oauth")
-            },
-            installer_id=installation_data.get("installer_user_id", "unknown"),
-            installer_name=installation_data.get("installer_name", "Unknown User"),
-            scopes=installation_data.get("scopes", []),
-            supabase_user_id=installation_data.get("supabase_user_id"),
-            metadata={
-                "oauth_timestamp": datetime.now().isoformat(),
-                "encryption_key_id": encryption_key_id
-            }
-        )
+            
+        except Exception as prisma_error:
+            logger.warning(f"Prisma operation failed, trying direct SQL: {prisma_error}")
+            
+            # Fallback to direct SQL insertion
+            await store_installation_direct_sql(installation_data, encrypted_token, encryption_key_id)
         
         logger.info(f"✅ Successfully stored installation data for team {installation_data['team_id']}")
         return True
@@ -275,6 +283,72 @@ async def store_installation_with_prisma(installation_data: Dict[str, Any]) -> b
     except Exception as e:
         logger.error(f"❌ Failed to store installation data: {e}")
         return False
+
+async def store_installation_direct_sql(installation_data: Dict[str, Any], encrypted_token: str, encryption_key_id: str):
+    """Fallback method using direct SQL when Prisma schema doesn't match"""
+    import asyncpg
+    
+    database_url = os.getenv("DIRECT_URL") or os.getenv("DATABASE_URL")
+    if not database_url:
+        raise Exception("No database URL available")
+    
+    conn = await asyncpg.connect(database_url)
+    try:
+        # Check if tenant exists
+        existing = await conn.fetchrow(
+            "SELECT team_id FROM tenants WHERE team_id = $1",
+            installation_data["team_id"]
+        )
+        
+        if existing:
+            # Update existing tenant
+            await conn.execute("""
+                UPDATE tenants SET 
+                    team_name = $2,
+                    encrypted_bot_token = $3,
+                    encryption_key_id = $4,
+                    bot_user_id = $5,
+                    installer_name = $6,
+                    updated_at = $7,
+                    last_active = $7
+                WHERE team_id = $1
+            """, 
+                installation_data["team_id"],
+                installation_data["team_name"],
+                encrypted_token,
+                encryption_key_id,
+                installation_data["bot_user_id"],
+                installation_data.get("installer_name", "Unknown User"),
+                datetime.now()
+            )
+            logger.info(f"✅ Updated tenant via direct SQL for team {installation_data['team_id']}")
+        else:
+            # Insert new tenant
+            await conn.execute("""
+                INSERT INTO tenants (
+                    team_id, team_name, encrypted_bot_token, encryption_key_id,
+                    bot_user_id, installed_by, installer_name, plan, status,
+                    settings, created_at, updated_at, last_active
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            """,
+                installation_data["team_id"],
+                installation_data["team_name"],
+                encrypted_token,
+                encryption_key_id,
+                installation_data["bot_user_id"],
+                installation_data.get("installer_user_id", "unknown"),
+                installation_data.get("installer_name", "Unknown User"),
+                "FREE",  # plan
+                "ACTIVE",  # status
+                "{}",  # settings as JSON string
+                datetime.now(),  # created_at
+                datetime.now(),  # updated_at
+                datetime.now()   # last_active
+            )
+            logger.info(f"✅ Created tenant via direct SQL for team {installation_data['team_id']}")
+            
+    finally:
+        await conn.close()
 
 @app.get("/api/user/workspaces")
 async def get_user_workspaces_api(user: dict = Depends(verify_supabase_token)):

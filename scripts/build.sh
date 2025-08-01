@@ -10,8 +10,8 @@ pip install -r requirements.txt
 echo "🗄️ Generating Prisma client..."
 python -m prisma generate
 
-# Push database schema
-echo "📋 Setting up database schema..."
-python -m prisma db push --accept-data-loss
+# Run database migration
+echo "🔧 Running database migration..."
+python scripts/migrate_database.py
 
 echo "✅ Build process completed successfully!"

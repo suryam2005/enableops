@@ -27,10 +27,7 @@ https://enableops-backend.madrasco.space/dashboard
 https://enableops-backend.madrasco.space/auth
 ```
 
-**❌ Remove any localhost URLs:**
-- Remove: `http://localhost:3000`
-- Remove: `http://localhost:8000`
-- Remove: Any other localhost entries
+
 
 ### Step 2: Fix Email Confirmation Settings
 
